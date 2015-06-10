@@ -43,8 +43,14 @@
         <artifactId>scallop_2.10</artifactId>
         <version>0.9.5</version>
     </dependency>
+    <dependency>
+        <groupId>org.elasticsearch</groupId>
+        <artifactId>elasticsearch</artifactId>
+        <version>1.5.2</version>
+    </dependency>
 
-    <!-- Test -->
+
+      <!-- Test -->
     <dependency>
       <groupId>junit</groupId>
       <artifactId>junit</artifactId>

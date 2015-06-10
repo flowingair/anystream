@@ -1,9 +1,11 @@
 package com.meizu.anystream
 
+import sun.misc.{Signal, SignalHandler}
 import java.sql.{SQLException, Connection, DriverManager}
 import java.text.SimpleDateFormat
 import java.util.Date
 import com.google.protobuf.InvalidProtocolBufferException
+import org.apache.spark.sql.types.StructType
 
 import scala.collection.JavaConverters._
 import scala.io.Source
@@ -19,6 +21,7 @@ import com.taobao.metamorphosis.Message
 
 import com.meizu.spark.streaming.metaq.MetaQReceiver
 import com.meizu.spark.metaq.MetaQWriter
+import org.elasticsearch.node.NodeBuilder._
 
 
 class ArgsOptsConf (arguments: Seq[String]) extends ScallopConf(arguments) {
@@ -28,8 +31,15 @@ class ArgsOptsConf (arguments: Seq[String]) extends ScallopConf(arguments) {
              |Options:
              |""".stripMargin)
 //    val properties: Map[String, String] = propsLong[String](name = "hiveconf", keyName = "property", descr = "Use value for given property")
-    val confPath: ScallopOption[String] = opt[String](required = true, name = "conf", argName = "properties-file", noshort = true, descr = "configuration file")
-    val hqlPath : ScallopOption[String] = trailArg[String](required = true, name = "hql-script", descr = "hive sql file to execute")
+    val confPath: ScallopOption[String] = opt[String](required = true, name = "conf", argName = "properties-file",
+        noshort = true, descr = "configuration file")
+    val transHqlPath : ScallopOption[String] = opt[String](required = false, name = "transform",
+        argName = "transform-HQL-file", noshort = true, descr = "transform hql script")
+    val lowLatencyHqlPath : ScallopOption[String] = opt[String](required = false, name = "ll_action",
+        argName = "action-HQL-file", noshort = true, descr = "hql script for stream with low latency")
+    val highLatencyHqlPath : ScallopOption[String] = opt[String](required = false, name = "hl_action",
+        argName = "action-HQL-file", noshort = true, descr = "hql script for stream with high latency")
+//    val hqlPath : ScallopOption[String] = trailArg[String](required = true, name = "hql-script", descr = "hive sql file to execute")
 }
 
 case class Load (
@@ -58,9 +68,14 @@ object ETL extends Logging {
             """(?:[sS][qQ][lL]\s+[oO][nN]\s+([eE][nN][tT][eE][rR]|[eE][xX][iI][tT])\s*'((?:[^']|\\')*)'\s*)?""" +
             """(?:[sS][qQ][lL]\s+[oO][nN]\s+([eE][nN][tT][eE][rR]|[eE][xX][iI][tT])\s*'((?:[^']|\\')*)'\s*)?""" +
             """((?:[sS][eE][lL][eE][cC][tT]|[wW][iI][tT][hH]).*)""").r
+    private  val esMatcher = (
+            """(?s)^\s*[iI][nN][sS][eE][rR][tT]\s+[iI][nN][tT][oO]\s+""" +
+            """[dD][iI][rR][eE][cC][tT][oO][rR][yY]\s+""" +
+            """'([eE][sS]:.*?)'\s+(.*)""").r
 
     private val metaqURLExtractor = """[mM][eE][tT][aA][qQ]://([^/]*)/([^/\?]*)(?:\?(.*))?""".r
     private val jdbcURLExtractor = """(.*)/([^/\?]*)(\?.*)?""".r
+    private val esURLExtractor = """[eE][sS]://([^/\?]*)""".r
     private val dayPartitionMatcher = """([\d]*)?[d|D]""".r
     private val hourPartitionMatcher = """([\d]*)?[h|H]""".r
     private val minutePartitionMatcher = """([\d]*)?[m|M]""".r
@@ -140,7 +155,7 @@ object ETL extends Logging {
         val hqlList = String.copyValueOf(hqlStr.toArray)
                 .split(hqlSeparator)
                 .map(ele =>
-                    ele.split("\n")
+                     ele.split("\n")
                         .filter(line => !(line.trim.startsWith("--") || line.trim.isEmpty))
                         .map(_ + "\n").fold("")(_ + _)
                 )
@@ -224,16 +239,39 @@ object ETL extends Logging {
             } else {
                 null
             }
-            if (triggers.get("enter") != None) {
-                triggers.get("enter").get.foreach(sql => statement.execute(sql))
+            triggers.get("enter") match {
+                case Some(sqlsOnEnter) => sqlsOnEnter.foreach(sql => statement.execute(sql))
+                case None =>
             }
             df.insertIntoJDBC(jdbcURL, tableName, overwrite = false)
-            if (triggers.get("exit") != None) {
-                triggers.get("exit").get.foreach(sql => statement.execute(sql))
+            triggers.get("exit") match {
+                case Some(sqlsonExit) => sqlsonExit.foreach(sql => statement.execute(sql))
+                case None =>
             }
         } catch {
             case e: SQLException => e.printStackTrace()
         }
+        hqlContext.emptyDataFrame
+    }
+
+    def writeES (hqlContext : HiveContext, esURL: String, hql : String) : DataFrame = {
+        val df = hqlContext.sql(hql)
+        val esCluster = esURL match {
+            case esURLExtractor(cluster) => cluster
+        }
+        val dfColumns = df.columns
+
+        df.rdd.foreachPartition(part => {
+            val node = nodeBuilder().clusterName(esCluster).client(true).node()
+            val client = node.client()
+            part.foreach(element => {
+                val json = (for (ix <- 0 until dfColumns.length) yield {
+                    (dfColumns(ix), element(ix))
+                }).toMap
+                client.prepareIndex().setSource(json).execute().actionGet()
+            })
+            node.close()
+        })
         hqlContext.emptyDataFrame
     }
 
@@ -242,19 +280,39 @@ object ETL extends Logging {
             case jdbcMatcher(jdbcPath, trigger1, trigger1Sql, trigger2, trigger2Sql, sql) =>
                 writeJDBC(hqlContext, jdbcPath, trigger1, trigger1Sql, trigger2, trigger2Sql, sql)
             case metaqMatcher(metaqURL, sql) => writeMetaQ(hqlContext, metaqURL, sql)
+            case esMatcher(esURL, sql)       => writeES(hqlContext, esURL, sql)
             case _ => hqlContext.sql(hql)
         }
     }
 
-    def createStreamingContext(checkpointDirectory: String, hqlPath: String): StreamingContext = {
-        val appName  = getProperty("anystream.spark.appName", Some("AnySteam-UXIP-ETL"))
+    def createStreamingContext(checkpointDirectory: String,
+                               transHqlPath: Option[String],
+                               lowLatencyHqlPath: Option[String],
+                               highLatencyHqlPath: Option[String]): StreamingContext = {
+        val appName  = getProperty("anystream.spark.appName", Some("AnySteam-ETL"))
         val streamingInterval = getProperty("anystream.spark.streaming.interval", None).toLong
         val metaqZkConnect = getProperty("anystream.metaq.zkConnect", None)
         val metaqTopic  = getProperty("anystream.metaq.topic", None)
         val metaqGroup  = getProperty("anystream.metaq.group", None)
         val metaqRunner = getProperty("anystream.metaq.runners", Some(5.toString)).toInt
+        val checkpointInterval = getProperty("anystream.spark.streaming.checkpointInterval", Some("5")).toInt
+        val lowLatencyStreamPartitions  = getProperty("anystream.lowLatency.partitions",  Some("2")).toInt
+        val highLatencyStreamPartitions = getProperty("anystream.highLatency.partitions", Some("2")).toInt
+        val lowLatencyStreamWindow  = getProperty("anystream.lowLatency.window", Some("1:1"))
+                .split(":")
+                .map(_.trim)
+                .padTo(2, "1")
+                .map(str => if (str.isEmpty) 1L else str.toLong)
+                .map(_ * streamingInterval)
+                .map(Seconds(_))
+        val highLatencyStreamWindow = getProperty("anystream.highLatency.window",Some("1:1"))
+                .split(":")
+                .map(_.trim)
+                .padTo(2, "1")
+                .map(str => if (str.isEmpty) 1L else str.toLong)
+                .map(_ * streamingInterval)
+                .map(Seconds(_))
 
-        val hqls = parseHql(hqlPath)
         val sparkConf = if (!appName.trim.isEmpty) {
             new SparkConf().setAppName(appName.trim)
         } else {
@@ -269,8 +327,9 @@ object ETL extends Logging {
                 val (interface, magic, partition, config_id, send_timestamp) =
                     (load.getInterface, load.getMagic, load.getPartition, load.getConfigId, load.getSendTimestamp)
                 val data = load.getData.toByteArray
+                val msgId = ("__msgId__", msg.getId.toString)
                 val ext_domain = load.getExtDomainList.asScala.map(entry => (entry.getKey, entry.getValue)).toMap
-                Load(interface, magic, partition, data, ext_domain, config_id, send_timestamp)
+                Load(interface, magic, partition, data, ext_domain + msgId, config_id, send_timestamp)
             } catch{
                 case e: InvalidProtocolBufferException =>
                     logWarning("invalid message format : " + e.getStackTraceString)
@@ -279,23 +338,62 @@ object ETL extends Logging {
             }
         })
 
-        asDFStream.foreachRDD(rdd => {
+        var schema : StructType = null
+        val transHqls = transHqlPath match {
+            case Some(path) => parseHql(path)
+            case None => List(("""_""", """SELECT * FROM `__root__`"""))
+        }
+        val base = asDFStream.transform(rdd => {
             val hqlContext = getInstance(rdd.sparkContext)
             import hqlContext.implicits._
 
+            var result : DataFrame = null
             val df = rdd.toDF()
 //            val interfaces = df.select($"interface").distinct.collect().map(_.getString(0))
 //            for (interface <- interfaces) {
 //                df.filter($"interface" <=> interface).registerTempTable(interface + "_asDF")
 //            }
             df.registerTempTable("__root__")
-            for ((tableName, hql) <- hqls) {
+            for ((tableName, hql) <- transHqls if !hql.trim.toLowerCase.startsWith("insert")) {
                 val tblDF = executeHql(hqlContext, hql) // hqlContext.sql(hql)
                 if (tableName != "_") {
                     tblDF.registerTempTable(tableName)
                 }
+                result = tblDF
             }
+            schema = result.schema
+            result.rdd
         })
+
+        base.checkpoint(Seconds(checkpointInterval * streamingInterval))
+
+        val asActionConfig = List(
+            (lowLatencyHqlPath,  lowLatencyStreamWindow,  lowLatencyStreamPartitions,  "__llbase__"),
+            (highLatencyHqlPath, highLatencyStreamWindow, highLatencyStreamPartitions, "__hlbase__")
+        )
+        for ( (actionHqlPath, actionStreamWindow, actionPartitions, baseTableName) <- asActionConfig) {
+            actionHqlPath match {
+                case Some(path) =>
+                    val actionHqls = parseHql(path)
+                    val (windowDuration, slidesDuration) = (actionStreamWindow(0), actionStreamWindow(1))
+                    val actionStream = base
+                            .window(windowDuration, slidesDuration)
+                            .repartition(actionPartitions)
+                    actionStream.foreachRDD(rdd => {
+                        val hqlContext = getInstance(rdd.sparkContext)
+
+                        val df = hqlContext.createDataFrame(rdd, schema)
+                        df.registerTempTable(baseTableName)
+                        for ((tableName, hql) <- actionHqls) {
+                            val tblDF = executeHql(hqlContext, hql) // hqlContext.sql(hql)
+                            if (tableName != "_") {
+                                tblDF.registerTempTable(tableName)
+                            }
+                        }
+                    })
+                case None =>
+            }
+        }
 
         ssc.checkpoint(checkpointDirectory)
         ssc
@@ -322,10 +420,23 @@ object ETL extends Logging {
             new ArgsOptsConf(List("--help"))
         }
         val confPath = optsConf.confPath.get.get
-        val hqlPath  = optsConf.hqlPath.get.get
+        val transHqlPath  = optsConf.transHqlPath.get
+        val lowLatencyHqlPath = optsConf.lowLatencyHqlPath.get
+        val highLatencyHqlPath = optsConf.highLatencyHqlPath.get
         setEnv(confPath)
         val checkpointDirectory = getProperty("anystream.spark.streaming.checkpointDir", None)
-        val ssc = StreamingContext.getOrCreate(checkpointDirectory, () => createStreamingContext(checkpointDirectory, hqlPath))
+        val ssc = StreamingContext.getOrCreate(checkpointDirectory, () =>
+            createStreamingContext(checkpointDirectory, transHqlPath, lowLatencyHqlPath, highLatencyHqlPath))
+
+        Signal.handle(new Signal("TERM"), new SignalHandler {
+            override def handle(signal: Signal): Unit = {
+                val sc = ssc.sparkContext
+                log.info("Stopping gracefully Spark Streaming!")
+                ssc.stop(stopSparkContext = false, stopGracefully = true)
+                log.info("Spark Stream has gracefully stopped")
+                sc.stop()
+            }
+        })
         ssc.start()
         ssc.awaitTermination()
     }

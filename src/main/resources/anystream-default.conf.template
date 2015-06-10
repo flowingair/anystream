@@ -1,9 +1,14 @@
 
-anystream.spark.streaming.checkpointDir     hdfs:///user/${user.name}/spark-streaming-checkpointDir  
-anystream.spark.appName		                AnySteam-UXIP-ETL
-anystream.spark.streaming.interval	        3
-anystream.metaq.zkConnect                   172.16.200.239:2181,172.16.200.233:2181,172.16.200.234:2181
-anystream.metaq.topic                       ORION_UXIP_DATA
-anystream.metaq.group                       ORION_UXIP_ETL
-anystream.metaq.runners                     5
-anystream.hql                              sqlFileName
+anystream.spark.streaming.checkpointDir          hdfs:///user/${user.name}/spark-streaming-checkpointDir
+//anystream.spark.streaming.checkpointInterval   5
+anystream.spark.appName		                     AnySteam-UXIP-ETL
+anystream.spark.streaming.interval	             3
+anystream.metaq.zkConnect                        172.16.200.239:2181,172.16.200.233:2181,172.16.200.234:2181
+anystream.metaq.topic                            ORION_UXIP_DATA
+anystream.metaq.group                            ORION_UXIP_ETL
+anystream.metaq.runners                          5
+//anystream.hql                                  sqlFileName
+anystream.lowLatency.window                      1:1
+anystream.highLatency.window                     20:20
+anystream.lowLatency.partitions                  2
+anystream.highLatency.partitions                 2
