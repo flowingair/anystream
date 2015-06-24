@@ -25,6 +25,7 @@ message ASDataFrame {
     repeated ASMapEntity ext_domain = 5;                  // 数据帧的附加数据 
     optional sint32 config_id = 6 [default = -1];         // 生成此数据帧的配置ID，可选项，主要用于调试
 	optional int64  send_timestamp = 7 [default = 0];     // 数据帧的发送时间戳，单位为毫秒，可选项，主要用于调试
+	optional int32  compression = 8 [default = 0];        // 数据帧的数据是否压缩，0为不压缩，可选项，默认不压缩, 1为gzip压缩
 }
 
 message ASCommandFrame {

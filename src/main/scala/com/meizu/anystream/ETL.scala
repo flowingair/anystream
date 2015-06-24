@@ -1,6 +1,10 @@
 package com.meizu.anystream
 
+
+import java.nio.charset.Charset
+
 import sun.misc.{Signal, SignalHandler}
+import java.util.zip.GZIPInputStream
 import java.sql.{SQLException, Connection, DriverManager}
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -21,8 +25,11 @@ import com.taobao.metamorphosis.Message
 
 import com.meizu.spark.streaming.metaq.MetaQReceiver
 import com.meizu.spark.metaq.MetaQWriter
-import org.elasticsearch.node.NodeBuilder._
+import com.meizu.anystream.util.Compression
 
+//import org.elasticsearch.node.NodeBuilder._
+//import org.elasticsearch.common.settings.ImmutableSettings
+//import org.elasticsearch.client.transport.TransportClient
 
 class ArgsOptsConf (arguments: Seq[String]) extends ScallopConf(arguments) {
 
@@ -46,7 +53,7 @@ case class Load (
     interface:String,
     magic:java.lang.Integer,
     partition:String,
-    data:Array[Byte],
+    data:Array[Array[Byte]],
     ext_domain:Map[String,String],
     config_id:java.lang.Integer,
     send_timestamp:java.lang.Long
@@ -57,7 +64,8 @@ case class Load (
  */
 object ETL extends Logging {
     @transient private var instance: HiveContext = null
-    private  val metaqMatcher = (
+    private val charset = Charset.forName("UTF-8")
+    private val metaqMatcher = (
             """(?s)^\s*[iI][nN][sS][eE][rR][tT]\s+[iI][nN][tT][oO]\s+""" +
             """[dD][iI][rR][eE][cC][tT][oO][rR][yY]\s+""" +
             """'([mM][eE][tT][aA][qQ]:.*?)'\s+(.*)""").r
@@ -117,6 +125,20 @@ object ETL extends Logging {
                     case _ => null
                 }
             })
+            instance.udf.register("str_to_array_of_map",
+                (str: String, arrayElementDelimiter: String, mapElementDelimiter: String, keyValDelimiter: String) => {
+                    if (str != null) {
+                        str.split(arrayElementDelimiter).filter(!_.trim.isEmpty).map(eleStr => {
+                            eleStr.split(mapElementDelimiter).filter(!_.trim.isEmpty)
+                                    .map(_.split(keyValDelimiter).padTo(2, ""))
+                                    .map(arr => (arr(0), arr(1)))
+                                    .toMap
+                        })
+                    } else {
+                        null
+                    }
+            })
+            instance.udf.register("utf8", (bytes : Array[Byte]) => new String(bytes, charset))
         }
         instance
     }
@@ -179,29 +201,42 @@ object ETL extends Logging {
         }
         val metaqWriterRef = MetaQWriter(zkCluster, topic)
         df.rdd.foreachPartition(part => {
+            var isInException = true
             val metaqWriter = metaqWriterRef.copy()
-            metaqWriter.init()
-            part.foreach(element => {
-                val data = element match {
-                    case Row(col1: Array[Byte]) => col1
-                    case _ => null
-                }
-                if (data != null) {
-                    val msg = new Message(metaqWriter.getTopic, data) // element.toString().getBytes
-                    try {
-                        val sendResult = metaqWriter.sendMessage(msg)
-                        if (!sendResult.isSuccess) {
-                            logError("Send message failed,error message:" + sendResult.getErrorMessage)
-                        } else {
-                            logInfo("Send message successfully,sent to " + sendResult.getPartition)
+            while (isInException) {
+                try {
+                    metaqWriter.init()
+                    part.foreach(element => {
+                        val data = element match {
+                            case Row(col1: Array[Byte]) => col1
+                            case _ => null
                         }
-                    } catch {
-                        case e: MetaClientException =>
-                            logError("Send message exception : " + e.getStackTraceString)
-                    }
+                        if (data != null) {
+                            val msg = new Message(metaqWriter.getTopic, data) // element.toString().getBytes
+                            val sendResult = metaqWriter.sendMessage(msg)
+                            if (!sendResult.isSuccess) {
+                                logError("Send message failed,error message:" + sendResult.getErrorMessage)
+                            }
+                        }
+                    })
+                    isInException = false
+                } catch {
+                    case e: MetaClientException =>
+                        isInException = true
+                        logError("Send message exception : " + e.getStackTraceString)
+                } finally {
+                    metaqWriter.close()
                 }
-            })
-            metaqWriter.close()
+
+                if (isInException) {
+                    try {
+                        Thread.sleep(3000)
+                    } catch {
+                        case e: InterruptedException =>
+                    }
+                    logError("trying to resend message ...")
+                }
+            }
         })
         hqlContext.emptyDataFrame
     }
@@ -259,19 +294,31 @@ object ETL extends Logging {
         val esCluster = esURL match {
             case esURLExtractor(cluster) => cluster
         }
-        val dfColumns = df.columns
+//        val dfColumns = df.columns
+//        val esIndex = ""
+//        val esType = ""
+//
+//        df.toJSON.foreachPartition(part =>{
+//            val settings = ImmutableSettings.settingsBuilder.put("cluster.name", esCluster).build
+//            val client = new TransportClient(settings)
+//                .addTransportAddress("172.16.82.131", 9300)
+//            part.foreach(json => {
+//                client.prepareIndex(esIndex, esType).setSource(json).execute().actionGet()
+//            })
+//            client.close()
+//        })
 
-        df.rdd.foreachPartition(part => {
-            val node = nodeBuilder().clusterName(esCluster).client(true).node()
-            val client = node.client()
-            part.foreach(element => {
-                val json = (for (ix <- 0 until dfColumns.length) yield {
-                    (dfColumns(ix), element(ix))
-                }).toMap
-                client.prepareIndex().setSource(json).execute().actionGet()
-            })
-            node.close()
-        })
+//        df.foreachPartition(part => {
+//            val node = nodeBuilder().clusterName(esCluster).client(true).node()
+//            val client = node.client()
+//            part.foreach(element => {
+//                val json = (for (ix <- 0 until dfColumns.length) yield {
+//                    (dfColumns(ix), element(ix))
+//                }).toMap
+//                client.prepareIndex(esIndex, esType).setSource(json).execute().actionGet()
+//            })
+//            node.close()
+//        })
         hqlContext.emptyDataFrame
     }
 
@@ -280,7 +327,7 @@ object ETL extends Logging {
             case jdbcMatcher(jdbcPath, trigger1, trigger1Sql, trigger2, trigger2Sql, sql) =>
                 writeJDBC(hqlContext, jdbcPath, trigger1, trigger1Sql, trigger2, trigger2Sql, sql)
             case metaqMatcher(metaqURL, sql) => writeMetaQ(hqlContext, metaqURL, sql)
-            case esMatcher(esURL, sql)       => writeES(hqlContext, esURL, sql)
+//            case esMatcher(esURL, sql)       => writeES(hqlContext, esURL, sql)
             case _ => hqlContext.sql(hql)
         }
     }
@@ -326,7 +373,22 @@ object ETL extends Logging {
                 val load = ASMessage.ASDataFrame.parseFrom(msg.getData)
                 val (interface, magic, partition, config_id, send_timestamp) =
                     (load.getInterface, load.getMagic, load.getPartition, load.getConfigId, load.getSendTimestamp)
-                val data = load.getData.toByteArray
+                val compressionType = load.getCompression
+                val data = compressionType match {
+                    case 0 =>
+                        new String(load.getData.toByteArray, charset).split("\n").map(str => {
+                            str.replace(0x01.toChar, 0x11.toChar).getBytes(charset)
+                        })
+                    case 1 =>
+                        val uncompressBytes = Compression.uncompress[GZIPInputStream](load.getData.toByteArray)
+                        new String(uncompressBytes, charset).split("\n").map(str => {
+                            str.replace(0x01.toChar, 0x11.toChar).getBytes(charset)
+                        })
+                    case _ =>
+                        logError("unknown data compression format "
+                                + s"(msgId : ${msg.getId.toString}, msgInterface : ${load.getInterface})" )
+                        Array.empty[Array[Byte]]
+                }
                 val msgId = ("__msgId__", msg.getId.toString)
                 val ext_domain = load.getExtDomainList.asScala.map(entry => (entry.getKey, entry.getValue)).toMap
                 Load(interface, magic, partition, data, ext_domain + msgId, config_id, send_timestamp)
