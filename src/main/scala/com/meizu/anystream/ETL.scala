@@ -3,13 +3,16 @@ package com.meizu.anystream
 
 import java.nio.charset.Charset
 
+//import org.apache.spark.rdd.RDD
 import sun.misc.{Signal, SignalHandler}
 import java.util.zip.GZIPInputStream
-import java.sql.{SQLException, Connection, DriverManager}
+import java.sql.{Statement, SQLException, Connection, DriverManager}
 import java.text.SimpleDateFormat
 import java.util.Date
+import java.util.TimeZone
+import java.util.Properties
 import com.google.protobuf.InvalidProtocolBufferException
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.types.{StringType, StructType}
 
 import scala.collection.JavaConverters._
 import scala.io.Source
@@ -62,31 +65,40 @@ case class Load (
 /**
  * @author ${user.name}
  */
-object ETL extends Logging {
+object  ETL extends Logging {
     @transient private var instance: HiveContext = null
-    private val charset = Charset.forName("UTF-8")
-    private val metaqMatcher = (
+    final val charset = Charset.forName("UTF-8")
+    final val metaqMatcher = (
             """(?s)^\s*[iI][nN][sS][eE][rR][tT]\s+[iI][nN][tT][oO]\s+""" +
             """[dD][iI][rR][eE][cC][tT][oO][rR][yY]\s+""" +
             """'([mM][eE][tT][aA][qQ]:.*?)'\s+(.*)""").r
-    private val jdbcMatcher = (
-            """(?s)^\s*[iI][nN][sS][eE][rR][tT]\s+[iI][nN][tT][oO]\s+""" +
-            """[dD][iI][rR][eE][cC][tT][oO][rR][yY]\s+""" +
-            """'([jJ][dD][bB][cC]:.*?)'\s*""" +
+    final val jdbcInsertMatcher = (
+            """(?s)^\s*[iI][nN][sS][eE][rR][tT]\s+[iI][nN][tT][oO]\s+[tT][aA][bB][lL][eE]\s+""" + """(.+?)\s+""" +
+            """[uU][sS][iI][nN][gG]\s+'([jJ][dD][bB][cC]:.*?)'\s*""" +
             """(?:[sS][qQ][lL]\s+[oO][nN]\s+([eE][nN][tT][eE][rR]|[eE][xX][iI][tT])\s*'((?:[^']|\\')*)'\s*)?""" +
             """(?:[sS][qQ][lL]\s+[oO][nN]\s+([eE][nN][tT][eE][rR]|[eE][xX][iI][tT])\s*'((?:[^']|\\')*)'\s*)?""" +
             """((?:[sS][eE][lL][eE][cC][tT]|[wW][iI][tT][hH]).*)""").r
-    private  val esMatcher = (
+    final val jdbcUpdateMatcher = (
+            """(?s)^\s*[uU][pP][dD][aA][tT][eE]\s+[tT][aA][bB][lL][eE]\s+""" +
+            """(.+?)\s+""" + """[sS][eE][tT](.+?)\s+""" +
+            """[uU][sS][iI][nN][gG]\s+'([jJ][dD][bB][cC]:.*?)'\s+""" +
+            """(?:""" + """[cC][aA][lL][lL][bB][aA][cC][kK]\s+[oO][nN]\s+[nN][oO][uU][pP][dD][aA][tT][eE]\s*""" +
+            """'((?:[^']|\\')*)'\s*""" + """)?""" +
+            """((?:[sS][eE][lL][eE][cC][tT]|[wW][iI][tT][hH]).*)""").r
+    final val esMatcher = (
             """(?s)^\s*[iI][nN][sS][eE][rR][tT]\s+[iI][nN][tT][oO]\s+""" +
             """[dD][iI][rR][eE][cC][tT][oO][rR][yY]\s+""" +
             """'([eE][sS]:.*?)'\s+(.*)""").r
+    final val jsonMatcher = (
+            """(?s)^\s*[cC][rR][eE][aA][tT][eE]\s+[tT][eE][mM][pP][oO][rR][aA][rR][yY]\s+[tT][aA][bB][lL][eE]\s+""" +
+            """(\S+)\s+[uU][sS][iI][nN][gG]\s+org\.apache\.spark\.sql\.json\s+[aA][sS]\s+(.*)""").r
 
-    private val metaqURLExtractor = """[mM][eE][tT][aA][qQ]://([^/]*)/([^/\?]*)(?:\?(.*))?""".r
-    private val jdbcURLExtractor = """(.*)/([^/\?]*)(\?.*)?""".r
-    private val esURLExtractor = """[eE][sS]://([^/\?]*)""".r
-    private val dayPartitionMatcher = """([\d]*)?[d|D]""".r
-    private val hourPartitionMatcher = """([\d]*)?[h|H]""".r
-    private val minutePartitionMatcher = """([\d]*)?[m|M]""".r
+    final val metaqURLExtractor = """[mM][eE][tT][aA][qQ]://([^/]*)/([^/\?]*)(?:\?(.*))?""".r
+//    final val jdbcURLExtractor = """(.*)/([^/\?]*)(\?.*)?""".r
+    final val esURLExtractor = """[eE][sS]://([^/\?]*)""".r
+    final val dayPartitionMatcher = """([\d]*)?[d|D]""".r
+    final val hourPartitionMatcher = """([\d]*)?[h|H]""".r
+    final val minutePartitionMatcher = """([\d]*)?[m|M]""".r
 
 
     // Instantiate HiveContext on demand
@@ -94,6 +106,8 @@ object ETL extends Logging {
         if (instance == null) {
             instance = new HiveContext(sparkContext)
             instance.udf.register("partitioner", (partition: String, timestamp: Long) => {
+                val offset = TimeZone.getDefault.getOffset(timestamp)
+                val biasTimestamp = timestamp + offset
                 partition match {
                     case dayPartitionMatcher(dInterval) =>
                         val interval = if (dInterval != null && !dInterval.isEmpty) {
@@ -101,7 +115,8 @@ object ETL extends Logging {
                         } else {
                             24 * 3600 * 1000L
                         }
-                        val dt = new Date(timestamp - timestamp % interval)
+                        val ts = (biasTimestamp - biasTimestamp % interval) - offset
+                        val dt = new Date(ts)
                         val dtFormatter = new SimpleDateFormat("yyyyMMdd")
                         new java.lang.Long(dtFormatter.format(dt).toLong)
                     case hourPartitionMatcher(hInterval) =>
@@ -110,7 +125,8 @@ object ETL extends Logging {
                         } else {
                             3600 * 1000L
                         }
-                        val dt = new Date(timestamp - timestamp % interval)
+                        val ts = (biasTimestamp - biasTimestamp % interval) - offset
+                        val dt = new Date(ts)
                         val dtFormatter = new SimpleDateFormat("yyyyMMddHH")
                         new java.lang.Long(dtFormatter.format(dt).toLong)
                     case minutePartitionMatcher(mInterval) =>
@@ -119,7 +135,8 @@ object ETL extends Logging {
                         } else {
                             60 * 1000L
                         }
-                        val dt = new Date(timestamp - timestamp % interval)
+                        val ts = (biasTimestamp - biasTimestamp % interval) - offset
+                        val dt = new Date(ts)
                         val dtFormatter = new SimpleDateFormat("yyyyMMddHHmm")
                         new java.lang.Long(dtFormatter.format(dt).toLong)
                     case _ => null
@@ -242,17 +259,30 @@ object ETL extends Logging {
     }
 
     def writeJDBC(hqlContext : HiveContext,
-                jdbcPath : String,
+                tableName: String,
+                jdbcURLStr : String,
                 trigger1 : String,
                 trigger1Sql : String,
                 trigger2 : String,
                 trigger2Sql : String,
                 hql : String): DataFrame = {
         val df = hqlContext.sql(hql)
-        val (resDescriptor, tableName, parameters) = jdbcPath match {
-            case jdbcURLExtractor(res, table, paras) => (res, table, paras)
+        val jdbcURL = jdbcURLStr.replaceAll("""\\;""", """;""")
+
+        if (jdbcURL.trim.toLowerCase.startsWith("jdbc:phoenix")) {
+            val phoenix = jdbcURL.trim.split( """:""")    // ["jdbc", "phoenix", "zkhost1,zhhost2", "zkClientPort", ...]
+            val properties = Map("table" -> tableName, "zkUrl" -> (phoenix(2) + ":" + phoenix(3)))
+            try {
+                df.save("org.apache.phoenix.spark", SaveMode.Overwrite, properties)
+//                df.write.format("org.apache.phoenix.spark").mode(SaveMode.Overwrite).options(properties).save()
+            } catch {
+                case e: Exception => logWarning("insert into hbase via phoenix : ", e)
+            }
+            return hqlContext.emptyDataFrame
         }
-        val jdbcURL = if (parameters != null) resDescriptor + parameters else resDescriptor
+
+        var conn : Connection = null
+        var stmt : Statement = null
         val triggers = mutable.Map.empty[String, Array[String]]
         val hasTrigger1 = (trigger1 != null) && (trigger1Sql != null)
         val hasTrigger2 = (trigger2 != null) && (trigger2Sql != null)
@@ -268,32 +298,115 @@ object ETL extends Logging {
             triggers += ((key2, value2))
         }
         try {
-            val statement = if (hasTriggers) {
-                val connection = DriverManager.getConnection(jdbcURL)
-                connection.createStatement()
-            } else {
-                null
+            if (hasTriggers) {
+                conn = DriverManager.getConnection(jdbcURL)
+                stmt = conn.createStatement()
             }
             triggers.get("enter") match {
-                case Some(sqlsOnEnter) => sqlsOnEnter.foreach(sql => statement.execute(sql))
+                case Some(sqlsOnEnter) => sqlsOnEnter.foreach(sql => stmt.execute(sql))
                 case None =>
             }
             df.insertIntoJDBC(jdbcURL, tableName, overwrite = false)
+//            df.write.mode(SaveMode.Append).jdbc(jdbcURL, tableName, new Properties)
             triggers.get("exit") match {
-                case Some(sqlsonExit) => sqlsonExit.foreach(sql => statement.execute(sql))
+                case Some(sqlsonExit) => sqlsonExit.foreach(sql => stmt.execute(sql))
                 case None =>
             }
         } catch {
-            case e: SQLException => e.printStackTrace()
+            case e: SQLException => logWarning("insert into database via jdbc : ", e)
+        } finally {
+            if (stmt != null) stmt.close()
+            if (conn != null) conn.close()
         }
         hqlContext.emptyDataFrame
     }
 
-    def writeES (hqlContext : HiveContext, esURL: String, hql : String) : DataFrame = {
+    def updateJDBC(hqlContext : HiveContext,
+                   tableName : String,
+                   updateSQLStr : String,
+                   jdbcURLStr : String,
+                   callbackSQL : String,
+                   hql : String) : DataFrame = {
         val df = hqlContext.sql(hql)
-        val esCluster = esURL match {
-            case esURLExtractor(cluster) => cluster
+        val jdbcURL = jdbcURLStr.replaceAll("""\\;""", """;""")
+
+        val (updateSqlPrefix, updateSQL) = if (jdbcURL.trim.toLowerCase.startsWith("jdbc:phoenix")) {
+            (s"UPSERT INTO $tableName", " " + updateSQLStr)
+        } else {
+            (s"UPDATE $tableName ", "SET " + updateSQLStr)
         }
+        val callback = if (callbackSQL != null) {
+            callbackSQL.replaceAll( """\\'""", """'""").split( """\\;""").filter(!_.trim.isEmpty)
+        } else {
+            null
+        }
+        val schema = df.schema.fields
+        df.rdd.foreachPartition(part => {
+            var conn : Connection = null
+            var stmt : Statement = null
+//            var committed = false
+            try {
+                conn = DriverManager.getConnection(jdbcURL)
+                conn.setAutoCommit(true)
+                stmt = conn.createStatement()
+                part.foreach(row => {
+                    val rowList = (
+                        for (ix <- 0 until row.length) yield {
+                            schema(ix).dataType match {
+                                case StringType =>
+                                    if(row.isNullAt(ix)) {
+                                        "NULL"
+                                    } else {
+                                        "'" + row(ix).toString.replaceAll("""'""", """\\'""") + "'"
+                                    }
+                                case _ => if (row.isNullAt(ix)) "NULL" else row(ix).toString
+                            }
+                        }
+                    ).toList
+                    val updateStatement = updateSqlPrefix +
+                        updateSQL.replaceAll("""((?<!%)%\d+)""", """$1\$s""").format(rowList: _*)
+                    val updatedRows = stmt.executeUpdate(updateStatement)
+                    if (updatedRows == 0 && callback != null) {
+                        callback.map(str =>
+                            str.replaceAll("""((?<!%)%\d+)""", """$1\$s""").format(rowList: _*)
+                        ).foreach(sql => stmt.execute(sql))
+                    }
+                })
+//                conn.commit()
+//                committed = true
+            } catch {
+                case e: SQLException => logWarning("update JDBC exception : ", e)
+            }finally {
+                if (stmt != null) stmt.close()
+                if (conn != null) conn.close()
+//                if (!committed) {
+//                    // The stage must fail.  We got here through an exception path, so
+//                    // let the exception through unless rollback() or close() want to
+//                    // tell the user about another problem.
+//                    try {
+//                        conn.rollback()
+//                        conn.close()
+//                    } catch {
+//                        case e: Exception => logWarning("Transaction failed", e)
+//                    }
+//                } else {
+//                    // The stage must succeed.  We cannot propagate any exception close() might throw.
+//                    try {
+//                        conn.close()
+//                    } catch {
+//                        case e: Exception => logWarning("Transaction succeeded, but closing failed", e)
+//                    }
+//                }
+            }
+        })
+        hqlContext.emptyDataFrame
+    }
+
+    def writeES (hqlContext : HiveContext, esURL: String, hql : String) : DataFrame = {
+//        val df = hqlContext.sql(hql)
+//        val esCluster = esURL match {
+//            case esURLExtractor(cluster) => cluster
+//        }
 //        val dfColumns = df.columns
 //        val esIndex = ""
 //        val esType = ""
@@ -322,11 +435,23 @@ object ETL extends Logging {
         hqlContext.emptyDataFrame
     }
 
+    def createJsonTable(hqlContext: HiveContext, tableName : String, hql : String) : DataFrame = {
+        val df = hqlContext.sql(hql)
+        val stringRDD = df.rdd.map(_.getString(0))
+        val jsonDF = hqlContext.jsonRDD(stringRDD)
+//        val jsonDF = hqlContext.read.json(stringRDD)
+        jsonDF.registerTempTable(tableName)
+        jsonDF
+    }
+
     def executeHql(hqlContext: HiveContext, hql : String): DataFrame = {
         hql match {
-            case jdbcMatcher(jdbcPath, trigger1, trigger1Sql, trigger2, trigger2Sql, sql) =>
-                writeJDBC(hqlContext, jdbcPath, trigger1, trigger1Sql, trigger2, trigger2Sql, sql)
+            case jdbcInsertMatcher(tableName, jdbcURL, trNo1, trNo1Sql, trNo2, trNo2Sql, sql) =>
+                writeJDBC(hqlContext, tableName, jdbcURL, trNo1, trNo1Sql, trNo2, trNo2Sql, sql.trim)
+            case jdbcUpdateMatcher(tableName, updateSql, jdbcURL, callbackSql, sql) =>
+                updateJDBC(hqlContext, tableName, updateSql, jdbcURL, callbackSql, sql.trim)
             case metaqMatcher(metaqURL, sql) => writeMetaQ(hqlContext, metaqURL, sql)
+            case jsonMatcher(jsonTableName, sql) => createJsonTable(hqlContext, jsonTableName, sql.trim)
 //            case esMatcher(esURL, sql)       => writeES(hqlContext, esURL, sql)
             case _ => hqlContext.sql(hql)
         }
@@ -377,12 +502,26 @@ object ETL extends Logging {
                 val data = compressionType match {
                     case 0 =>
                         new String(load.getData.toByteArray, charset).split("\n").map(str => {
-                            str.replace(0x01.toChar, 0x11.toChar).getBytes(charset)
+                            str.replace(0x01.toChar, 0x11.toChar)
+                               .replace(0x02.toChar, 0x12.toChar)
+                               .replace(0x03.toChar, 0x13.toChar)
+                               .replace(0x04.toChar, 0x14.toChar)
+                               .replace(0x05.toChar, 0x15.toChar)
+                               .replace(0x06.toChar, 0x16.toChar)
+                               .replace(0x07.toChar, 0x17.toChar)
+                               .getBytes(charset)
                         })
                     case 1 =>
                         val uncompressBytes = Compression.uncompress[GZIPInputStream](load.getData.toByteArray)
                         new String(uncompressBytes, charset).split("\n").map(str => {
-                            str.replace(0x01.toChar, 0x11.toChar).getBytes(charset)
+                            str.replace(0x01.toChar, 0x11.toChar)
+                               .replace(0x02.toChar, 0x12.toChar)
+                               .replace(0x03.toChar, 0x13.toChar)
+                               .replace(0x04.toChar, 0x14.toChar)
+                               .replace(0x05.toChar, 0x15.toChar)
+                               .replace(0x06.toChar, 0x16.toChar)
+                               .replace(0x07.toChar, 0x17.toChar)
+                               .getBytes(charset)
                         })
                     case _ =>
                         logError("unknown data compression format "

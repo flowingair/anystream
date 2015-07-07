@@ -1,7 +1,7 @@
 package com.meizu.spark.metaq
 
 
-import com.amazonaws.services.sns.model.Topic
+//import com.amazonaws.services.sns.model.Topic
 import com.taobao.metamorphosis.exception.MetaClientException
 import org.apache.spark.{SparkConf, SparkContext, Logging}
 
