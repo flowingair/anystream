@@ -49,6 +49,7 @@ class ArgsOptsConf (arguments: Seq[String]) extends ScallopConf(arguments) {
         argName = "action-HQL-file", noshort = true, descr = "hql script for stream with low latency")
     val highLatencyHqlPath : ScallopOption[String] = opt[String](required = false, name = "hl_action",
         argName = "action-HQL-file", noshort = true, descr = "hql script for stream with high latency")
+    val debugMode : ScallopOption[Boolean]  = toggle(name = "debug", default = Some(false), descrYes ="debug mode")
 //    val hqlPath : ScallopOption[String] = trailArg[String](required = true, name = "hql-script", descr = "hive sql file to execute")
 }
 
@@ -99,6 +100,8 @@ object  ETL extends Logging {
     final val dayPartitionMatcher = """([\d]*)?[d|D]""".r
     final val hourPartitionMatcher = """([\d]*)?[h|H]""".r
     final val minutePartitionMatcher = """([\d]*)?[m|M]""".r
+
+    final var isDebugMode = false
 
 
     // Instantiate HiveContext on demand
@@ -201,14 +204,22 @@ object  ETL extends Logging {
                 .filter(!_.trim.isEmpty)
                 .toList
 
-        for ( hql <- hqlList) yield {
+        val result = for ( hql <- hqlList) yield {
             val tagHql = hql.split(":=")
             if (tagHql.length == 1) {
                 ("_", tagHql(0).trim)
             } else {
-                (tagHql(0).trim, tagHql(1).trim)
+                val identifier = tagHql(0).trim
+                val hql = tagHql(1).trim
+                if (!isDebugMode && identifier.endsWith("_d_")) {
+                    ("", "")
+                } else {
+                    (identifier, hql)
+                }
             }
         }
+
+        result.filter(!_._1.trim.isEmpty)
     }
 
     def writeMetaQ(hqlContext : HiveContext, metaqURL : String, hql : String) : DataFrame = {
@@ -535,7 +546,9 @@ object  ETL extends Logging {
                 case e: InvalidProtocolBufferException =>
                     logWarning("invalid message format : " + e.getStackTraceString)
                     Load(null, null, null, null, null, null, null)
-                case ex: Throwable => throw ex
+                case ex: Throwable =>
+                    logWarning("unknown exception : " + ex.getStackTraceString)
+                    Load(null, null, null, null, null, null, null)
             }
         })
 
@@ -624,6 +637,7 @@ object  ETL extends Logging {
         val transHqlPath  = optsConf.transHqlPath.get
         val lowLatencyHqlPath = optsConf.lowLatencyHqlPath.get
         val highLatencyHqlPath = optsConf.highLatencyHqlPath.get
+        isDebugMode = optsConf.debugMode.get.get
         setEnv(confPath)
         val checkpointDirectory = getProperty("anystream.spark.streaming.checkpointDir", None)
         val ssc = StreamingContext.getOrCreate(checkpointDirectory, () =>
