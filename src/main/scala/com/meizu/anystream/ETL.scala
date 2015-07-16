@@ -473,14 +473,15 @@ object  ETL extends Logging {
                                lowLatencyHqlPath: Option[String],
                                highLatencyHqlPath: Option[String]): StreamingContext = {
         val appName  = getProperty("anystream.spark.appName", Some("AnySteam-ETL"))
-        val streamingInterval = getProperty("anystream.spark.streaming.interval", None).toLong
+        val streamingInterval = Math.abs(getProperty("anystream.spark.streaming.interval", None).toLong)
         val metaqZkConnect = getProperty("anystream.metaq.zkConnect", None)
         val metaqTopic  = getProperty("anystream.metaq.topic", None)
         val metaqGroup  = getProperty("anystream.metaq.group", None)
-        val metaqRunner = getProperty("anystream.metaq.runners", Some(5.toString)).toInt
-        val checkpointInterval = getProperty("anystream.spark.streaming.checkpointInterval", Some("5")).toInt
-        val lowLatencyStreamPartitions  = getProperty("anystream.lowLatency.partitions",  Some("2")).toInt
-        val highLatencyStreamPartitions = getProperty("anystream.highLatency.partitions", Some("2")).toInt
+        val metaqRunner = Math.abs(getProperty("anystream.metaq.runners", Some(5.toString)).toInt)
+        val checkpointInterval = Math.abs(getProperty("anystream.spark.streaming.checkpointInterval", Some("5")).toInt)
+        val transformStreamPartitions   = Math.abs(getProperty("anystream.transform.partitions", Some("0")).toInt)
+        val lowLatencyStreamPartitions  = Math.abs(getProperty("anystream.lowLatency.partitions",  Some("0")).toInt)
+        val highLatencyStreamPartitions = Math.abs(getProperty("anystream.highLatency.partitions", Some("0")).toInt)
         val lowLatencyStreamWindow  = getProperty("anystream.lowLatency.window", Some("1:1"))
                 .split(":")
                 .map(_.trim)
@@ -504,7 +505,12 @@ object  ETL extends Logging {
 
         val ssc = new StreamingContext(sparkConf, Seconds(streamingInterval))
         val messages = ssc.receiverStream(new MetaQReceiver(metaqZkConnect, metaqTopic, metaqGroup, metaqRunner))
-        val asDFStream =  messages.map(msg => {
+        val msgStream = if ( transformStreamPartitions == 0) {
+            messages
+        } else {
+            messages.repartition(transformStreamPartitions)
+        }
+        val asDFStream =  msgStream.map(msg => {
             try {
                 val load = ASMessage.ASDataFrame.parseFrom(msg.getData)
                 val (interface, magic, partition, config_id, send_timestamp) =
@@ -571,7 +577,12 @@ object  ETL extends Logging {
             for ((tableName, hql) <- transHqls if !hql.trim.toLowerCase.startsWith("insert")) {
                 val tblDF = executeHql(hqlContext, hql) // hqlContext.sql(hql)
                 if (tableName != "_") {
-                    tblDF.registerTempTable(tableName)
+                    val npartions = Math.abs(hqlContext.getConf("anystream.dataframe.partitions", "0").toInt)
+                    if (npartions == 0) {
+                        tblDF.registerTempTable(tableName)
+                    } else {
+                        tblDF.coalesce(npartions).registerTempTable(tableName)
+                    }
                 }
                 result = tblDF
             }
@@ -579,7 +590,7 @@ object  ETL extends Logging {
             result.rdd
         })
 
-        base.checkpoint(Seconds(checkpointInterval * streamingInterval))
+//        base.checkpoint(Seconds(checkpointInterval * streamingInterval))
 
         val asActionConfig = List(
             (lowLatencyHqlPath,  lowLatencyStreamWindow,  lowLatencyStreamPartitions,  "__llbase__"),
@@ -590,9 +601,11 @@ object  ETL extends Logging {
                 case Some(path) =>
                     val actionHqls = parseHql(path)
                     val (windowDuration, slidesDuration) = (actionStreamWindow(0), actionStreamWindow(1))
-                    val actionStream = base
-                            .window(windowDuration, slidesDuration)
-                            .repartition(actionPartitions)
+                    val actionStream = if (actionPartitions == 0) {
+                        base.window(windowDuration, slidesDuration)
+                    } else {
+                        base.window(windowDuration, slidesDuration).repartition(actionPartitions)
+                    }
                     actionStream.foreachRDD(rdd => {
                         val hqlContext = getInstance(rdd.sparkContext)
 
@@ -601,7 +614,12 @@ object  ETL extends Logging {
                         for ((tableName, hql) <- actionHqls) {
                             val tblDF = executeHql(hqlContext, hql) // hqlContext.sql(hql)
                             if (tableName != "_") {
-                                tblDF.registerTempTable(tableName)
+                                val npartions = Math.abs(hqlContext.getConf("anystream.dataframe.partitions", "0").toInt)
+                                if (npartions == 0) {
+                                    tblDF.registerTempTable(tableName)
+                                } else {
+                                    tblDF.coalesce(npartions).registerTempTable(tableName)
+                                }
                             }
                         }
                     })

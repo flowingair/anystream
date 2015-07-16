@@ -10,5 +10,7 @@ anystream.metaq.runners                          5
 //anystream.hql                                  sqlFileName
 anystream.lowLatency.window                      1:1
 anystream.highLatency.window                     20:20
+anystream.transform.partitions                   2
 anystream.lowLatency.partitions                  2
 anystream.highLatency.partitions                 2
+//anystream.dataframe.partitions
