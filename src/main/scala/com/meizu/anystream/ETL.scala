@@ -353,6 +353,8 @@ object  ETL extends Logging {
         }
         val schema = df.schema.fields
         df.rdd.foreachPartition(part => {
+            val formatStub = """((?<!%)%\d+)""".r
+            val formatCtor = """$1\$s"""
             var conn : Connection = null
             var stmt : Statement = null
 //            var committed = false
@@ -375,11 +377,11 @@ object  ETL extends Logging {
                         }
                     ).toList
                     val updateStatement = updateSqlPrefix +
-                        updateSQL.replaceAll("""((?<!%)%\d+)""", """$1\$s""").format(rowList: _*)
+                            formatStub.replaceAllIn(updateSQL, formatCtor).format(rowList: _*)
                     val updatedRows = stmt.executeUpdate(updateStatement)
                     if (updatedRows == 0 && callback != null) {
                         callback.map(str =>
-                            str.replaceAll("""((?<!%)%\d+)""", """$1\$s""").format(rowList: _*)
+                            formatStub.replaceAllIn(str, formatCtor).format(rowList: _*)
                         ).foreach(sql => stmt.execute(sql))
                     }
                 })
@@ -581,7 +583,7 @@ object  ETL extends Logging {
                     if (npartions == 0) {
                         tblDF.registerTempTable(tableName)
                     } else {
-                        tblDF.coalesce(npartions).registerTempTable(tableName)
+                        tblDF.repartition(npartions).registerTempTable(tableName)
                     }
                 }
                 result = tblDF
@@ -618,7 +620,7 @@ object  ETL extends Logging {
                                 if (npartions == 0) {
                                     tblDF.registerTempTable(tableName)
                                 } else {
-                                    tblDF.coalesce(npartions).registerTempTable(tableName)
+                                    tblDF.repartition(npartions).registerTempTable(tableName)
                                 }
                             }
                         }

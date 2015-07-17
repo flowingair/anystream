@@ -4,18 +4,19 @@ import org.scalatest.FunSuite
 import org.scalatest.Assertions
 import org.scalatest.matchers.ShouldMatchers
 import org.rogach.scallop.{ScallopOption, ScallopConf}
-
+import org.apache.spark.{SparkContext, SparkConf, Logging}
+import org.apache.spark.sql.hive.HiveContext
 import org.junit.runner.RunWith
 import org.scalatest.junit.JUnitRunner
 
 @RunWith(classOf[JUnitRunner])
 class ETLSuite extends FunSuite with ShouldMatchers{
-//    test("parse hql file") {
-//        val root = System.getProperty("user.dir")
-//        ETL.isDebugMode = true
-//        val hqls = ETL.parseHql(root + "/src/test/scala/test.hive.sql")
-//        println (hqls)
-//    }
+    ignore("parse hql file") {
+        val root = System.getProperty("user.dir")
+        ETL.isDebugMode = true
+        val hqls = ETL.parseHql(root + "/src/test/scala/as_sm_ll_action.hive.sql")
+        hqls.foreach(println)
+    }
 
     test("a jsonMatcher should extract clause of creating jsonTable from stringTable") {
         val str =
@@ -146,5 +147,91 @@ class ETLSuite extends FunSuite with ShouldMatchers{
         val toggle3  = new ArgsOptsConf(List("--nodebug", "--conf", "xxx"))
         toggle3.debugMode.get should equal(Some(false))
         toggle3.debugMode.isSupplied should equal(true)
+    }
+
+    ignore("test updateJDBC") {
+        val sConf = new SparkConf().setMaster("local[*]").setAppName("Anystream-Framework-Test")
+        val sCtxt = new SparkContext(sConf)
+        val hqlCtxt = new HiveContext(sCtxt)
+        val hqlEx = Array(
+            """CREATE TEMPORARY TABLE ServiceMetric
+              |USING org.apache.spark.sql.json
+              |AS
+              |SELECT '{"state" : [{"id":"0", "ap":"ap", "k1":"k1", "k2":"k2", "k3":"1270010010010", "vs":[0, 0, 0, 0, 0, 0]}], "ip":"127001001001", "t":"0"}';
+              |""".stripMargin ,
+            """SELECT  stat.ap as appName
+              |      , stat.k1 as service
+              |      , stat.k2 as method
+              |      , substr(stat.k3, 1, 12) as rip
+              |      , stat.vs[0] AS counts
+              |      , stat.vs[1] AS ok_counts
+              |      , stat.vs[2] AS timeout_counts
+              |      , stat.vs[3] AS reject_counts
+              |      , stat.vs[4] AS err_counts
+              |      , stat.vs[5] AS rt
+              |      , cast(ip AS STRING) AS ip
+              |      , cast(t  AS BIGINT)  AS t
+              |      , cast(substr(stat.k3, 13, 1) AS BIGINT) as type
+              |      , cast(from_unixtime(CAST(t / 1000 AS BIGINT),'yyyyMMdd') AS BIGINT) nowtime
+              |FROM ServiceMetric LATERAL VIEW explode(state) stateTable AS stat
+              |""".stripMargin ,
+            """UPDATE TABLE T_SERVER_IND_METRIC SET
+              |( ROWKEY
+              |, SER_IND_MTC.APPNAME
+              |, SER_IND_MTC.RIP
+              |, SER_IND_MTC.COUNT
+              |, SER_IND_MTC.SCOUNT
+              |, SER_IND_MTC.RCOUNT
+              |, SER_IND_MTC.ECOUNT
+              |, SER_IND_MTC.TOCOUNT
+              |, SER_IND_MTC.RT
+              |, SER_IND_MTC.TIME
+              |, SER_IND_MTC.TYPE)
+              |SELECT
+              |  %1
+              |, %2
+              |, %3
+              |, TO_CHAR(TO_NUMBER(SER_IND_MTC.COUNT) + %4)
+              |, TO_CHAR(TO_NUMBER(SER_IND_MTC.SCOUNT) + %5)
+              |, TO_CHAR(TO_NUMBER(SER_IND_MTC.RCOUNT) + %6)
+              |, TO_CHAR(TO_NUMBER(SER_IND_MTC.ECOUNT) + %7)
+              |, TO_CHAR(TO_NUMBER(SER_IND_MTC.TOCOUNT) + %8)
+              |, TO_CHAR(TO_NUMBER(SER_IND_MTC.RT) + %9)
+              |, TO_CHAR(%10)
+              |, TO_CHAR(%11)
+              |FROM T_SERVER_IND_METRIC WHERE ROWKEY = %1
+              |USING 'jdbc:phoenix:172.16.200.239,172.16.200.233,172.16.200.234:2181'
+              |CALLBACK ON NOUPDATE 'UPSERT INTO T_SERVER_IND_METRIC(
+              |  ROWKEY
+              |, SER_IND_MTC.APPNAME
+              |, SER_IND_MTC.RIP
+              |, SER_IND_MTC.COUNT
+              |, SER_IND_MTC.SCOUNT
+              |, SER_IND_MTC.RCOUNT
+              |, SER_IND_MTC.ECOUNT
+              |, SER_IND_MTC.TOCOUNT
+              |, SER_IND_MTC.RT
+              |, SER_IND_MTC.TIME
+              |, SER_IND_MTC.TYPE)
+              |VALUES(%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11 )'
+              |SELECT  concat_ws('-', cast(rip AS STRING), cast(type AS STRING), cast(t AS STRING))
+              |      , appName
+              |      , rip
+              |      , cast(counts AS BIGINT)
+              |      , cast(ok_counts AS BIGINT)
+              |      , cast(reject_counts AS BIGINT)
+              |      , cast(err_counts  AS BIGINT)
+              |      , cast(timeout_counts AS BIGINT)
+              |      , cast(rt AS BIGINT)
+              |      , cast(t AS BIGINT)
+              |      , cast(type AS BIGINT)
+              |FROM StatesDetail
+              |""".stripMargin
+        )
+        ETL.executeHql(hqlCtxt, hqlEx(0))
+        ETL.executeHql(hqlCtxt, hqlEx(1)).registerTempTable("StatesDetail")
+        ETL.executeHql(hqlCtxt, hqlEx(2))
+
+        sCtxt.stop()
     }
 }
