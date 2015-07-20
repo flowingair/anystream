@@ -358,6 +358,7 @@ object  ETL extends Logging {
             var conn : Connection = null
             var stmt : Statement = null
 //            var committed = false
+            var sqlClause = ""
             try {
                 conn = DriverManager.getConnection(jdbcURL)
                 conn.setAutoCommit(true)
@@ -370,25 +371,30 @@ object  ETL extends Logging {
                                     if(row.isNullAt(ix)) {
                                         "NULL"
                                     } else {
-                                        "'" + row(ix).toString.replaceAll("""'""", """\\'""") + "'"
+                                        val str = row(ix).toString.replaceAll("""'""", """\\'""")
+                                        "'" + str + "'"
                                     }
                                 case _ => if (row.isNullAt(ix)) "NULL" else row(ix).toString
                             }
                         }
                     ).toList
-                    val updateStatement = updateSqlPrefix +
+                    val updateStatement = formatStub.replaceAllIn(updateSqlPrefix, formatCtor).format(rowList: _*) +
                             formatStub.replaceAllIn(updateSQL, formatCtor).format(rowList: _*)
+                    sqlClause = updateStatement
                     val updatedRows = stmt.executeUpdate(updateStatement)
                     if (updatedRows == 0 && callback != null) {
                         callback.map(str =>
                             formatStub.replaceAllIn(str, formatCtor).format(rowList: _*)
-                        ).foreach(sql => stmt.execute(sql))
+                        ).foreach(sql => {
+                            sqlClause = sql
+                            stmt.execute(sql)
+                        })
                     }
                 })
 //                conn.commit()
 //                committed = true
             } catch {
-                case e: SQLException => logWarning("update JDBC exception : ", e)
+                case e: SQLException => logWarning(s"update JDBC exception ${sqlClause} : ", e)
             }finally {
                 if (stmt != null) stmt.close()
                 if (conn != null) conn.close()
