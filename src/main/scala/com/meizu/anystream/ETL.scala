@@ -3,6 +3,8 @@ package com.meizu.anystream
 
 import java.nio.charset.Charset
 
+import scala.collection.immutable.HashSet
+
 //import org.apache.spark.rdd.RDD
 import sun.misc.{Signal, SignalHandler}
 import java.util.zip.GZIPInputStream
@@ -159,6 +161,22 @@ object  ETL extends Logging {
                     }
             })
             instance.udf.register("utf8", (bytes : Array[Byte]) => new String(bytes, charset))
+            instance.udf.register("filter_not", (event: Map[String, String], keySeq: Seq[String]) => {
+                val keySet = HashSet(keySeq: _*)
+                event.filterKeys(!keySet.contains(_))
+            })
+            instance.udf.register("encrypt", (str: String) => {
+                val key = Array[Byte](-93, -117, -26, -128, 93, -67, -99, 12)
+                val data = str.getBytes(charset)
+                val result = for ( ix <- 0 until data.length) yield {
+                    (data(ix) ^ key(ix % 8)).toByte
+                }
+                new String(result.toArray, charset)
+            })
+            instance.udf.register("map_to_str",
+                (mapObj: Map[String,String], mapElementDelimiter: String, keyValDelimiter: String) => {
+                    mapObj.map(pair => pair._1 + keyValDelimiter + pair._2).mkString(mapElementDelimiter)
+            })
         }
         instance
     }
@@ -480,7 +498,7 @@ object  ETL extends Logging {
                                transHqlPath: Option[String],
                                lowLatencyHqlPath: Option[String],
                                highLatencyHqlPath: Option[String]): StreamingContext = {
-        val appName  = getProperty("anystream.spark.appName", Some("AnySteam-ETL"))
+//        val appName  = getProperty("anystream.spark.appName", Some("AnySteam-ETL"))
         val streamingInterval = Math.abs(getProperty("anystream.spark.streaming.interval", None).toLong)
         val metaqZkConnect = getProperty("anystream.metaq.zkConnect", None)
         val metaqTopic  = getProperty("anystream.metaq.topic", None)
@@ -505,11 +523,7 @@ object  ETL extends Logging {
                 .map(_ * streamingInterval)
                 .map(Seconds(_))
 
-        val sparkConf = if (!appName.trim.isEmpty) {
-            new SparkConf().setAppName(appName.trim)
-        } else {
-            new SparkConf()
-        }
+        val sparkConf = new SparkConf()
 
         val ssc = new StreamingContext(sparkConf, Seconds(streamingInterval))
         val messages = ssc.receiverStream(new MetaQReceiver(metaqZkConnect, metaqTopic, metaqGroup, metaqRunner))
@@ -589,7 +603,7 @@ object  ETL extends Logging {
                     if (npartions == 0) {
                         tblDF.registerTempTable(tableName)
                     } else {
-                        tblDF.repartition(npartions).registerTempTable(tableName)
+                        tblDF.coalesce(npartions).registerTempTable(tableName)
                     }
                 }
                 result = tblDF
@@ -626,7 +640,7 @@ object  ETL extends Logging {
                                 if (npartions == 0) {
                                     tblDF.registerTempTable(tableName)
                                 } else {
-                                    tblDF.repartition(npartions).registerTempTable(tableName)
+                                    tblDF.coalesce(npartions).registerTempTable(tableName)
                                 }
                             }
                         }
