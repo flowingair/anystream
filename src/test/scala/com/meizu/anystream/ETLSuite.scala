@@ -18,6 +18,25 @@ class ETLSuite extends FunSuite with ShouldMatchers{
         hqls.foreach(println)
     }
 
+    test("a jdbcLoadMatcher should extract clause of loading data from external DB via JDBC interface") {
+        val str =
+            """
+              | IMPORT TABLE imei_whitelist FROM t_uxip_test_imei_white
+              | USING 'jdbc:mysql://172.16.10.235:3306/MEIZU_DB_ORION?user=mysqluser&password=mysqluser'
+            """.stripMargin
+        val (sparkTable, jdbcTable, jdbcURL) = str match {
+            case ETL.jdbcLoadMatcher(st, et, url) => (st, et, url)
+            case _=> ("", "", "")
+        }
+//        println(sparkTable)
+//        println(jdbcTable)
+//        println(jdbcURL)
+
+        sparkTable should be ("imei_whitelist")
+        jdbcTable should be ("t_uxip_test_imei_white")
+        jdbcURL should be ("jdbc:mysql://172.16.10.235:3306/MEIZU_DB_ORION?user=mysqluser&password=mysqluser")
+    }
+
     test("a jsonMatcher should extract clause of creating jsonTable from stringTable") {
         val str =
             """
@@ -36,11 +55,10 @@ class ETLSuite extends FunSuite with ShouldMatchers{
         hql should be ("""SELECT '{"k1":"v1", "k2":"v2", "k3":{"sk1":"sv1", "sk2":"sv2"}}'""")
     }
 
-    test("a jdbcInsertMatcher should be extract clause of insert into external tables " +
-         "with data in spark-sql via jdbc interface"){
+    test("a jdbcInsertMatcher should be extract clause of insert into external tables from spark table"){
         val str =
             """
-              | INSERT INTO TABLE tableName
+              | INSERT INTO TABLE tableName (x, y, z)
               | USING 'jdbc:sqlserver://ip:port/DatabaseName=xxx\;user=meizu\;password=12345'
               | SQL on ENTER 'delete * from xxx\;'
               | SQL on EXIT 'drop table yyy\; insert into zzz(x) values (\'abc\')'
@@ -59,7 +77,7 @@ class ETLSuite extends FunSuite with ShouldMatchers{
         println(trNo2)
         println(trNo2Sql)
         println(hql)
-        tableName should be ("tableName")
+        tableName should be ("tableName (x, y, z)")
         jdbcUrl.replaceAll("""\\;""", """;""") should be ("jdbc:sqlserver://ip:port/DatabaseName=xxx;user=meizu;password=12345")
         trNo1 should be ("ENTER")
         trNo1Sql should be ("""delete * from xxx\;""")

@@ -95,6 +95,9 @@ object  ETL extends Logging {
     final val jsonMatcher = (
             """(?s)^\s*[cC][rR][eE][aA][tT][eE]\s+[tT][eE][mM][pP][oO][rR][aA][rR][yY]\s+[tT][aA][bB][lL][eE]\s+""" +
             """(\S+)\s+[uU][sS][iI][nN][gG]\s+org\.apache\.spark\.sql\.json\s+[aA][sS]\s+(.*)""").r
+    final val jdbcLoadMatcher = (
+            """(?s)^\s*[iI][mM][pP][oO][rR][tT]\s+[tT][aA][bB][lL][eE]\s+(.+?)\s+[fF][rR][oO][mM]\s+(.+?)\s+""" +
+            """[uU][sS][iI][nN][gG]\s+'([jJ][dD][bB][cC]:.*?)'\s*""").r
 
     final val metaqURLExtractor = """[mM][eE][tT][aA][qQ]://([^/]*)/([^/\?]*)(?:\?(.*))?""".r
 //    final val jdbcURLExtractor = """(.*)/([^/\?]*)(\?.*)?""".r
@@ -335,8 +338,8 @@ object  ETL extends Logging {
                 case Some(sqlsOnEnter) => sqlsOnEnter.foreach(sql => stmt.execute(sql))
                 case None =>
             }
-            df.insertIntoJDBC(jdbcURL, tableName, overwrite = false)
-//            df.write.mode(SaveMode.Append).jdbc(jdbcURL, tableName, new Properties)
+//            df.insertIntoJDBC(jdbcURL, tableName, overwrite = false)
+            df.write.mode(SaveMode.Append).jdbc(jdbcURL, tableName, new Properties)
             triggers.get("exit") match {
                 case Some(sqlsonExit) => sqlsonExit.foreach(sql => stmt.execute(sql))
                 case None =>
@@ -439,6 +442,24 @@ object  ETL extends Logging {
         hqlContext.emptyDataFrame
     }
 
+    def loadFromJDBC(hqlContext : HiveContext,
+                     sparkTable : String,
+                     jdbcTable : String,
+                     jdbcURL : String) : DataFrame = {
+        try {
+            val df = hqlContext.read.jdbc(jdbcURL, jdbcTable, new Properties())
+            df.registerTempTable(sparkTable)
+        } catch {
+            case e: Exception =>
+                if (hqlContext.tableNames().contains(sparkTable)) {
+                    logWarning(s"Loading external table ${jdbcTable} from ${jdbcURL} fails, use old data")
+                } else {
+                    throw e
+                }
+        }
+        hqlContext.emptyDataFrame
+    }
+
     def writeES (hqlContext : HiveContext, esURL: String, hql : String) : DataFrame = {
 //        val df = hqlContext.sql(hql)
 //        val esCluster = esURL match {
@@ -490,6 +511,8 @@ object  ETL extends Logging {
             case metaqMatcher(metaqURL, sql) => writeMetaQ(hqlContext, metaqURL, sql)
             case jsonMatcher(jsonTableName, sql) => createJsonTable(hqlContext, jsonTableName, sql.trim)
 //            case esMatcher(esURL, sql)       => writeES(hqlContext, esURL, sql)
+            case jdbcLoadMatcher(sparkTable, jdbcTable, jdbcURL) =>
+                loadFromJDBC(hqlContext, sparkTable, jdbcTable, jdbcURL)
             case _ => hqlContext.sql(hql)
         }
     }
@@ -585,6 +608,7 @@ object  ETL extends Logging {
             case Some(path) => parseHql(path)
             case None => List(("""_""", """SELECT * FROM `__root__`"""))
         }
+        
         val base = asDFStream.transform(rdd => {
             val hqlContext = getInstance(rdd.sparkContext)
             import hqlContext.implicits._

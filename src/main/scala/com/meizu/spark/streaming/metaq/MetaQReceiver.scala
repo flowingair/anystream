@@ -36,7 +36,7 @@ class MetaQReceiver (
     private var topic: String,     /* 消息主题 */
     private var group: String,     /* 消息分组 */
     private var runners: Int
-                               )extends Receiver[Message](StorageLevel.MEMORY_AND_DISK_2) with Logging {
+                               )extends Receiver[Message](StorageLevel.MEMORY_AND_DISK_SER) with Logging {
 
     private var sessionFactory: MessageSessionFactory = null
     private var consumer: MessageConsumer = null
