@@ -1,32 +1,33 @@
 package com.meizu.anystream
 
-
-import java.nio.charset.Charset
-
-import scala.collection.immutable.HashSet
-
-//import org.apache.spark.rdd.RDD
 import sun.misc.{Signal, SignalHandler}
+import java.nio.charset.Charset
+import java.security.MessageDigest
 import java.util.zip.GZIPInputStream
 import java.sql.{Statement, SQLException, Connection, DriverManager}
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.TimeZone
 import java.util.Properties
-import com.google.protobuf.InvalidProtocolBufferException
-import org.apache.spark.sql.types.{StringType, StructType}
 
-import scala.collection.JavaConverters._
 import scala.io.Source
 import scala.collection.mutable
+import scala.collection.JavaConverters._
+import scala.collection.immutable.HashSet
+
+import com.google.protobuf.ByteString
+import com.google.protobuf.InvalidProtocolBufferException
+
 import org.rogach.scallop.{ScallopOption, ScallopConf}
 
 import org.apache.spark.sql._
+import org.apache.spark.sql.types.{StringType, StructType}
 import org.apache.spark.sql.hive.HiveContext
 import org.apache.spark.{SparkContext, SparkConf, Logging}
 import org.apache.spark.streaming.{Seconds, StreamingContext}
-import com.taobao.metamorphosis.exception.MetaClientException
+
 import com.taobao.metamorphosis.Message
+import com.taobao.metamorphosis.exception.MetaClientException
 
 import com.meizu.spark.streaming.metaq.MetaQReceiver
 import com.meizu.spark.metaq.MetaQWriter
@@ -179,6 +180,26 @@ object  ETL extends Logging {
             instance.udf.register("map_to_str",
                 (mapObj: Map[String,String], mapElementDelimiter: String, keyValDelimiter: String) => {
                     mapObj.map(pair => pair._1 + keyValDelimiter + pair._2).mkString(mapElementDelimiter)
+            })
+            instance.udf.register("md5", (str : String) => {
+                val md = MessageDigest.getInstance("MD5").digest(str.getBytes(charset))
+                md.map(_ & 0xFF).map("%02x".format(_)).mkString
+            })
+            instance.udf.register("sha1", (str : String) => {
+                val md = MessageDigest.getInstance("SHA-1").digest(str.getBytes(charset))
+                md.map(_ & 0xFF).map("%02x".format(_)).mkString
+            })
+            instance.udf.register("sha256", (str : String) => {
+                val md = MessageDigest.getInstance("SHA-256").digest(str.getBytes(charset))
+                md.map(_ & 0xFF).map("%02x".format(_)).mkString
+            })
+            instance.udf.register("as_message", (interfaceName: String, data: String) => {
+                ASMessage.ASDataFrame.newBuilder()
+                    .setInterface(interfaceName)
+                    .setData(ByteString.copyFrom(data.getBytes(charset)))
+                    .setSendTimestamp(System.currentTimeMillis())
+                    .setCompression(0)
+                    .build().toByteArray
             })
         }
         instance
@@ -671,6 +692,54 @@ object  ETL extends Logging {
                     })
                 case None =>
             }
+        }
+
+        val statOutputUrl   = getProperty("anystream.stat.output.url", Some("")).trim
+        val statOutputTable = getProperty("anystream.stat.output.table", Some("T_ANYSTREAM_STAT")).trim
+        val statInterfaces  = getProperty("anystream.stat.interfaces", Some("")).trim
+        if (!statOutputUrl.trim.isEmpty) {
+            val statInterfacesList = statInterfaces.trim.split(',').filterNot(_.trim.isEmpty)
+            val interfacesFilterSql = if (statInterfacesList.isEmpty) {
+                "SELECT * FROM `__stat__`"
+            } else {
+                val predicate = statInterfacesList.map("'" + _ + "'"). mkString("(", ", ", ")")
+                s"SELECT * FROM `__stat__` WHERE interface IN ${predicate}"
+            }
+            val dataExpansionSql =
+                """
+                  | SELECT  interface
+                  |       , ext_domain['ip']       AS hostip
+                  |       , length(utf8(one_row))  AS sendbyte
+                  |       , partitioner(send_timestamp, 'm') AS sendtime
+                  | FROM stat_input LATERAL VIEW explode(data) mutli_rows AS one_row
+                """.stripMargin
+            val statAnalysisSql =
+                s"""
+                  | SELECT  'merger'         AS vendor
+                  |       , '${metaqTopic}'  AS topic
+                  |       , interface
+                  |       , hostip
+                  |       , sum(sendbyte)    AS sendbyte
+                  |       , count(*)         AS linenum
+                  |       , sendtime
+                  | FROM stat_data
+                  | GROUP BY interface, hostip, sendtime
+                """.stripMargin
+            asDFStream.foreachRDD(rdd => {
+                val hqlContext = getInstance(rdd.sparkContext)
+                import hqlContext.implicits._
+                rdd.toDF().registerTempTable("__stat__")
+                val stat_input = hqlContext.sql(interfacesFilterSql)
+                stat_input.registerTempTable("stat_input")
+                val stat_data = hqlContext.sql(dataExpansionSql)
+                stat_data.registerTempTable("stat_data")
+                val statResult = hqlContext.sql(statAnalysisSql)
+                try {
+                    statResult.write.mode(SaveMode.Append).jdbc(statOutputUrl, statOutputTable, new Properties)
+                } catch {
+                    case e: Exception => logWarning("fail to ouput satistical information : " + e.getStackTraceString)
+                }
+            })
         }
 
         ssc.checkpoint(checkpointDirectory)

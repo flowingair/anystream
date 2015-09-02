@@ -14,3 +14,6 @@ anystream.transform.partitions                   2
 anystream.lowLatency.partitions                  2
 anystream.highLatency.partitions                 2
 //anystream.dataframe.partitions
+anystream.stat.output.url                        jdbc:mysql://host:port/database?user=root&password=xxx
+anystream.stat.output.table                      T_ANYSTREAM_STAT
+anystream.stat.interfaces                        interfaces1,interfaces2,interfaces3
