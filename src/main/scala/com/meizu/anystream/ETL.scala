@@ -164,36 +164,67 @@ object  ETL extends Logging {
                         null
                     }
             })
-            instance.udf.register("utf8", (bytes : Array[Byte]) => new String(bytes, charset))
+            instance.udf.register("utf8", (bytes : Array[Byte]) => {
+                if (bytes != null ) new String(bytes, charset) else null
+            })
             instance.udf.register("filter_not", (event: Map[String, String], keySeq: Seq[String]) => {
-                val keySet = HashSet(keySeq: _*)
-                event.filterKeys(!keySet.contains(_))
+                if (event != null) {
+                    if (keySeq != null){
+                        val keySet = HashSet(keySeq: _*)
+                        event.filterKeys(!keySet.contains(_))
+                    } else {
+                        event
+                    }
+                } else {
+                    null
+                }
             })
             instance.udf.register("encrypt", (str: String) => {
-                val key = Array[Byte](-93, -117, -26, -128, 93, -67, -99, 12)
-                val data = str.getBytes(charset)
-                val result = for ( ix <- 0 until data.length) yield {
-                    (data(ix) ^ key(ix % 8)).toByte
+                if (str != null) {
+                    val key = Array[Byte](-93, -117, -26, -128, 93, -67, -99, 12)
+                    val data = str.getBytes(charset)
+                    val result = for ( ix <- 0 until data.length) yield {
+                        (data(ix) ^ key(ix % 8)).toByte
+                    }
+                    new String(result.toArray, charset)
+                } else {
+                    null
                 }
-                new String(result.toArray, charset)
             })
             instance.udf.register("map_to_str",
                 (mapObj: Map[String,String], mapElementDelimiter: String, keyValDelimiter: String) => {
-                    mapObj.map(pair => pair._1 + keyValDelimiter + pair._2).mkString(mapElementDelimiter)
+                    if (mapObj != null) {
+                        mapObj.map(pair => pair._1 + keyValDelimiter + pair._2).mkString(mapElementDelimiter)
+                    } else {
+                        null
+                    }
             })
             instance.udf.register("md5", (str : String) => {
-                val md = MessageDigest.getInstance("MD5").digest(str.getBytes(charset))
-                md.map(_ & 0xFF).map("%02x".format(_)).mkString
+                if (str != null) {
+                    val md = MessageDigest.getInstance("MD5").digest(str.getBytes(charset))
+                    md.map(_ & 0xFF).map("%02x".format(_)).mkString
+                } else {
+                    null
+                }
             })
             instance.udf.register("sha1", (str : String) => {
-                val md = MessageDigest.getInstance("SHA-1").digest(str.getBytes(charset))
-                md.map(_ & 0xFF).map("%02x".format(_)).mkString
+                if (str != null) {
+                    val md = MessageDigest.getInstance("SHA-1").digest(str.getBytes(charset))
+                    md.map(_ & 0xFF).map("%02x".format(_)).mkString
+                } else {
+                    null
+                }
             })
             instance.udf.register("sha256", (str : String) => {
-                val md = MessageDigest.getInstance("SHA-256").digest(str.getBytes(charset))
-                md.map(_ & 0xFF).map("%02x".format(_)).mkString
+                if (str != null) {
+                    val md = MessageDigest.getInstance("SHA-256").digest(str.getBytes(charset))
+                    md.map(_ & 0xFF).map("%02x".format(_)).mkString
+                } else {
+                    null
+                }
             })
             instance.udf.register("as_message", (interfaceName: String, data: String) => {
+                val bytes = if (data != null) data.getBytes(charset) else Array.emptyByteArray
                 ASMessage.ASDataFrame.newBuilder()
                     .setInterface(interfaceName)
                     .setData(ByteString.copyFrom(data.getBytes(charset)))
@@ -265,7 +296,8 @@ object  ETL extends Logging {
     }
 
     def writeMetaQ(hqlContext : HiveContext, metaqURL : String, hql : String) : DataFrame = {
-        val df = hqlContext.sql(hql)
+        val npartions = Math.abs(hqlContext.getConf("anystream.dataframe.partitions", "0").toInt)
+        val df = if (npartions == 0) { hqlContext.sql(hql) } else { hqlContext.sql(hql).coalesce(npartions) }
         val (zkCluster,  topic) = metaqURL match {
             case metaqURLExtractor(zkClusterAddr, topicName, parameters) => (zkClusterAddr, topicName)
         }
@@ -319,7 +351,8 @@ object  ETL extends Logging {
                 trigger2 : String,
                 trigger2Sql : String,
                 hql : String): DataFrame = {
-        val df = hqlContext.sql(hql)
+        val npartions = Math.abs(hqlContext.getConf("anystream.dataframe.partitions", "0").toInt)
+        val df = if (npartions == 0) { hqlContext.sql(hql) } else { hqlContext.sql(hql).coalesce(npartions) }
         val jdbcURL = jdbcURLStr.replaceAll("""\\;""", """;""")
 
         if (jdbcURL.trim.toLowerCase.startsWith("jdbc:phoenix")) {
@@ -380,84 +413,99 @@ object  ETL extends Logging {
                    jdbcURLStr : String,
                    callbackSQL : String,
                    hql : String) : DataFrame = {
-        val df = hqlContext.sql(hql)
-        val jdbcURL = jdbcURLStr.replaceAll("""\\;""", """;""")
+        val npartions = Math.abs(hqlContext.getConf("anystream.dataframe.partitions", "0").toInt)
+        val df = if (npartions == 0) { hqlContext.sql(hql) } else { hqlContext.sql(hql).coalesce(npartions) }
 
+        val jdbcURL = jdbcURLStr.replaceAll("""\\;""", """;""")
         val (updateSqlPrefix, updateSQL) = if (jdbcURL.trim.toLowerCase.startsWith("jdbc:phoenix")) {
             (s"UPSERT INTO $tableName", " " + updateSQLStr)
         } else {
             (s"UPDATE $tableName ", "SET " + updateSQLStr)
         }
+
         val callback = if (callbackSQL != null) {
             callbackSQL.replaceAll( """\\'""", """'""").split( """\\;""").filter(!_.trim.isEmpty)
         } else {
             null
         }
+
         val schema = df.schema.fields
+        val linesPerTransaction = Math.abs(hqlContext.getConf("anystream.jdbc.transaction.size", "0").toLong)
         df.rdd.foreachPartition(part => {
             val formatStub = """((?<!%)%\d+)""".r
             val formatCtor = """$1\$s"""
-            var conn : Connection = null
-            var stmt : Statement = null
-//            var committed = false
+//            var conn : Connection = null
+//            var stmt : Statement = null
+            val conn = DriverManager.getConnection(jdbcURL)
+            var committed = false
             var sqlClause = ""
             try {
-                conn = DriverManager.getConnection(jdbcURL)
-                conn.setAutoCommit(true)
-                stmt = conn.createStatement()
-                part.foreach(row => {
-                    val rowList = (
-                        for (ix <- 0 until row.length) yield {
-                            schema(ix).dataType match {
-                                case StringType =>
-                                    if(row.isNullAt(ix)) {
-                                        "NULL"
-                                    } else {
-                                        val str = row(ix).toString.replaceAll("""'""", """\\'""")
-                                        "'" + str + "'"
+                conn.setAutoCommit(false)
+                val stmt = conn.createStatement()
+                try {
+                    var lines = 0L
+                    while (part.hasNext) {
+                        val row = part.next()
+                        val rowList = (
+                                for (ix <- 0 until row.length) yield {
+                                    schema(ix).dataType match {
+                                        case StringType =>
+                                            if(row.isNullAt(ix)) {
+                                                "NULL"
+                                            } else {
+                                                val str = row(ix).toString.replaceAll("""'""", """\\'""")
+                                                "'" + str + "'"
+                                            }
+                                        case _ => if (row.isNullAt(ix)) "NULL" else row(ix).toString
                                     }
-                                case _ => if (row.isNullAt(ix)) "NULL" else row(ix).toString
-                            }
+                                }
+                                ).toList
+                        val updateStatement = formatStub.replaceAllIn(updateSqlPrefix, formatCtor).format(rowList: _*) +
+                                formatStub.replaceAllIn(updateSQL, formatCtor).format(rowList: _*)
+                        sqlClause = updateStatement
+                        val updatedRows = stmt.executeUpdate(updateStatement)
+                        if (updatedRows == 0 && callback != null) {
+                            callback.map(str =>
+                                formatStub.replaceAllIn(str, formatCtor).format(rowList: _*)
+                            ).foreach(sql => {
+                                sqlClause = sql
+                                stmt.execute(sql)
+                            })
                         }
-                    ).toList
-                    val updateStatement = formatStub.replaceAllIn(updateSqlPrefix, formatCtor).format(rowList: _*) +
-                            formatStub.replaceAllIn(updateSQL, formatCtor).format(rowList: _*)
-                    sqlClause = updateStatement
-                    val updatedRows = stmt.executeUpdate(updateStatement)
-                    if (updatedRows == 0 && callback != null) {
-                        callback.map(str =>
-                            formatStub.replaceAllIn(str, formatCtor).format(rowList: _*)
-                        ).foreach(sql => {
-                            sqlClause = sql
-                            stmt.execute(sql)
-                        })
+                        lines += 1
+                        if (linesPerTransaction != 0 && lines >= linesPerTransaction) {
+                            conn.commit()
+                            lines = 0
+                        }
                     }
-                })
-//                conn.commit()
-//                committed = true
+                } finally {
+                    stmt.close()
+                }
+                conn.commit()
+                committed = true
             } catch {
-                case e: SQLException => logWarning(s"update JDBC exception ${sqlClause} : ", e)
+                case e: SQLException => logWarning(s"update JDBC exception $sqlClause : ", e)
             }finally {
-                if (stmt != null) stmt.close()
-                if (conn != null) conn.close()
-//                if (!committed) {
-//                    // The stage must fail.  We got here through an exception path, so
-//                    // let the exception through unless rollback() or close() want to
-//                    // tell the user about another problem.
-//                    try {
-//                        conn.rollback()
-//                        conn.close()
-//                    } catch {
-//                        case e: Exception => logWarning("Transaction failed", e)
-//                    }
-//                } else {
-//                    // The stage must succeed.  We cannot propagate any exception close() might throw.
-//                    try {
-//                        conn.close()
-//                    } catch {
-//                        case e: Exception => logWarning("Transaction succeeded, but closing failed", e)
-//                    }
-//                }
+//                if (stmt != null) stmt.close()
+//                if (conn != null) conn.close()
+                if (!committed) {
+                    // The stage must fail.  We got here through an exception path, so
+                    // let the exception through unless rollback() or close() want to
+                    // tell the user about another problem.
+                    try {
+                        conn.rollback()
+                        conn.close()
+                    } catch {
+                        case e: Exception => logWarning("Transaction failed", e)
+                    }
+                } else {
+                    // The stage must succeed.  We cannot propagate any exception close() might throw.
+                    try {
+                        conn.close()
+                    } catch {
+                        case e: Exception => logWarning("Transaction succeeded, but closing failed", e)
+                    }
+                }
             }
         })
         hqlContext.emptyDataFrame
@@ -473,7 +521,7 @@ object  ETL extends Logging {
         } catch {
             case e: Exception =>
                 if (hqlContext.tableNames().contains(sparkTable)) {
-                    logWarning(s"Loading external table ${jdbcTable} from ${jdbcURL} fails, use old data")
+                    logWarning(s"Loading external table $jdbcTable from $jdbcURL fails, use old data")
                 } else {
                     throw e
                 }
@@ -517,9 +565,10 @@ object  ETL extends Logging {
     def createJsonTable(hqlContext: HiveContext, tableName : String, hql : String) : DataFrame = {
         val df = hqlContext.sql(hql)
         val stringRDD = df.rdd.map(_.getString(0))
-        val jsonDF = hqlContext.jsonRDD(stringRDD)
-//        val jsonDF = hqlContext.read.json(stringRDD)
+//        val jsonDF = hqlContext.jsonRDD(stringRDD)
+        val jsonDF = hqlContext.read.json(stringRDD)
         jsonDF.registerTempTable(tableName)
+        logInfo(s"the schema of $tableName : \n" + jsonDF.schema.treeString)
         jsonDF
     }
 
@@ -548,7 +597,7 @@ object  ETL extends Logging {
         val metaqTopic  = getProperty("anystream.metaq.topic", None)
         val metaqGroup  = getProperty("anystream.metaq.group", None)
         val metaqRunner = Math.abs(getProperty("anystream.metaq.runners", Some(5.toString)).toInt)
-        val checkpointInterval = Math.abs(getProperty("anystream.spark.streaming.checkpointInterval", Some("5")).toInt)
+//        val checkpointInterval = Math.abs(getProperty("anystream.spark.streaming.checkpointInterval", Some("5")).toInt)
         val transformStreamPartitions   = Math.abs(getProperty("anystream.transform.partitions", Some("0")).toInt)
         val lowLatencyStreamPartitions  = Math.abs(getProperty("anystream.lowLatency.partitions",  Some("0")).toInt)
         val highLatencyStreamPartitions = Math.abs(getProperty("anystream.highLatency.partitions", Some("0")).toInt)
@@ -582,9 +631,17 @@ object  ETL extends Logging {
                 val (interface, magic, partition, config_id, send_timestamp) =
                     (load.getInterface, load.getMagic, load.getPartition, load.getConfigId, load.getSendTimestamp)
                 val compressionType = load.getCompression
-                val data = compressionType match {
+                val bytes = compressionType match {
+                    case 0 => load.getData.toByteArray
+                    case 1 => Compression.uncompress[GZIPInputStream](load.getData.toByteArray)
+                    case _ =>
+                        logError("unknown data compression format "
+                                + s"(msgId : ${msg.getId.toString}, msgInterface : ${load.getInterface})" )
+                        Array.emptyByteArray
+                }
+                val data = magic match {
                     case 0 =>
-                        new String(load.getData.toByteArray, charset).split("\n").map(str => {
+                        new String(bytes, charset).split("\n").map(str => {
                             str.replace(0x01.toChar, 0x11.toChar)
                                .replace(0x02.toChar, 0x12.toChar)
                                .replace(0x03.toChar, 0x13.toChar)
@@ -595,20 +652,10 @@ object  ETL extends Logging {
                                .getBytes(charset)
                         })
                     case 1 =>
-                        val uncompressBytes = Compression.uncompress[GZIPInputStream](load.getData.toByteArray)
-                        new String(uncompressBytes, charset).split("\n").map(str => {
-                            str.replace(0x01.toChar, 0x11.toChar)
-                               .replace(0x02.toChar, 0x12.toChar)
-                               .replace(0x03.toChar, 0x13.toChar)
-                               .replace(0x04.toChar, 0x14.toChar)
-                               .replace(0x05.toChar, 0x15.toChar)
-                               .replace(0x06.toChar, 0x16.toChar)
-                               .replace(0x07.toChar, 0x17.toChar)
-                               .getBytes(charset)
+                        new String(bytes, charset).split("\n").map(str => {
+                            str.getBytes(charset)
                         })
                     case _ =>
-                        logError("unknown data compression format "
-                                + s"(msgId : ${msg.getId.toString}, msgInterface : ${load.getInterface})" )
                         Array.empty[Array[Byte]]
                 }
                 val msgId = ("__msgId__", msg.getId.toString)
@@ -703,26 +750,30 @@ object  ETL extends Logging {
                 "SELECT * FROM `__stat__`"
             } else {
                 val predicate = statInterfacesList.map("'" + _ + "'"). mkString("(", ", ", ")")
-                s"SELECT * FROM `__stat__` WHERE interface IN ${predicate}"
+                s"SELECT * FROM `__stat__` WHERE interface IN $predicate"
             }
             val dataExpansionSql =
                 """
                   | SELECT  interface
-                  |       , ext_domain['ip']       AS hostip
+                  |       , split(coalesce(ext_domain['ip'], 'Unknown'), ':')  AS host
                   |       , length(utf8(one_row))  AS sendbyte
-                  |       , partitioner(send_timestamp, 'm') AS sendtime
-                  | FROM stat_input LATERAL VIEW explode(data) mutli_rows AS one_row
+                  |       , send_timestamp
+                  | FROM `__stat_input__` LATERAL VIEW explode(data) mutli_rows AS one_row
                 """.stripMargin
             val statAnalysisSql =
                 s"""
                   | SELECT  'merger'         AS vendor
-                  |       , '${metaqTopic}'  AS topic
+                  |       , '$metaqTopic'  AS topic
                   |       , interface
                   |       , hostip
                   |       , sum(sendbyte)    AS sendbyte
                   |       , count(*)         AS linenum
                   |       , sendtime
-                  | FROM stat_data
+                  | FROM ( SELECT   interface
+                  |               , concat_ws(':', host[1], host[2]) AS hostip
+                  |               , sendbyte
+                  |               , partitioner(send_timestamp, 'm') AS sendtime
+                  |        FROM `__stat_data__` ) tmp
                   | GROUP BY interface, hostip, sendtime
                 """.stripMargin
             asDFStream.foreachRDD(rdd => {
@@ -730,9 +781,9 @@ object  ETL extends Logging {
                 import hqlContext.implicits._
                 rdd.toDF().registerTempTable("__stat__")
                 val stat_input = hqlContext.sql(interfacesFilterSql)
-                stat_input.registerTempTable("stat_input")
+                stat_input.registerTempTable("__stat_input__")
                 val stat_data = hqlContext.sql(dataExpansionSql)
-                stat_data.registerTempTable("stat_data")
+                stat_data.registerTempTable("__stat_data__")
                 val statResult = hqlContext.sql(statAnalysisSql)
                 try {
                     statResult.write.mode(SaveMode.Append).jdbc(statOutputUrl, statOutputTable, new Properties)
