@@ -2,7 +2,7 @@
   <modelVersion>4.0.0</modelVersion>
   <groupId>com.meizu.anystream</groupId>
   <artifactId>anystream</artifactId>
-  <version>1.0-SNAPSHOT</version>
+  <version>build_${maven.build.timestamp}</version>
   <name>${project.artifactId}</name>
   <description>My wonderfull scala app</description>
   <inceptionYear>2010</inceptionYear>
@@ -39,6 +39,12 @@
         <groupId>com.taobao.metamorphosis</groupId>
         <artifactId>metamorphosis-client</artifactId>
         <version>1.4.6.2</version>
+        <exclusions>
+            <exclusion>  <!-- declare the exclusion here -->
+                <groupId>org.jboss.netty</groupId>
+                <artifactId>netty</artifactId>
+            </exclusion>
+        </exclusions>
     </dependency>
     <dependency>
         <groupId>org.rogach</groupId>
@@ -64,14 +70,20 @@
         <version>${spark.version}</version>
         <scope>provided</scope>
     </dependency>
+    <!--<dependency>  &lt;!&ndash; declare the exclusion here &ndash;&gt;-->
+        <!--<groupId>org.jboss.netty</groupId>-->
+        <!--<artifactId>netty</artifactId>-->
+    <!--</dependency>-->
 
-    <dependency>
-        <groupId>mysql</groupId>
-        <artifactId>mysql-connector-java</artifactId>
-        <version>5.1.35</version>
-    </dependency>
 
-      <!-- Test -->
+  <dependency>
+      <groupId>mysql</groupId>
+      <artifactId>mysql-connector-java</artifactId>
+      <version>5.1.35</version>
+  </dependency>
+
+
+    <!-- Test -->
     <dependency>
       <groupId>junit</groupId>
       <artifactId>junit</artifactId>

@@ -4,7 +4,7 @@ import sun.misc.{Signal, SignalHandler}
 import java.nio.charset.Charset
 import java.security.MessageDigest
 import java.util.zip.GZIPInputStream
-import java.sql.{Statement, SQLException, Connection, DriverManager}
+import java.sql.{Statement, PreparedStatement, SQLException, Connection, DriverManager}
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.TimeZone
@@ -21,7 +21,7 @@ import com.google.protobuf.InvalidProtocolBufferException
 import org.rogach.scallop.{ScallopOption, ScallopConf}
 
 import org.apache.spark.sql._
-import org.apache.spark.sql.types.{StringType, StructType}
+import org.apache.spark.sql.types._
 import org.apache.spark.sql.hive.HiveContext
 import org.apache.spark.{SparkContext, SparkConf, Logging}
 import org.apache.spark.streaming.{Seconds, StreamingContext}
@@ -227,7 +227,7 @@ object  ETL extends Logging {
                 val bytes = if (data != null) data.getBytes(charset) else Array.emptyByteArray
                 ASMessage.ASDataFrame.newBuilder()
                     .setInterface(interfaceName)
-                    .setData(ByteString.copyFrom(data.getBytes(charset)))
+                    .setData(ByteString.copyFrom(bytes))
                     .setSendTimestamp(System.currentTimeMillis())
                     .setCompression(0)
                     .build().toByteArray
@@ -407,69 +407,160 @@ object  ETL extends Logging {
         hqlContext.emptyDataFrame
     }
 
+    private def setStatement(stmt: PreparedStatement, setRule : List[(Int, Int)], row : Row): Unit = {
+        val schema = row.schema.fields
+        for ((setIndex, rowIndex) <- setRule){
+            schema(rowIndex).dataType match {
+                case IntegerType =>
+                    if (row.isNullAt(rowIndex)) {
+                        stmt.setNull(setIndex, java.sql.Types.INTEGER)
+                    } else {
+                        stmt.setInt(setIndex, row.getInt(rowIndex))
+                    }
+                case LongType =>
+                    if (row.isNullAt(rowIndex)) {
+                        stmt.setNull(setIndex, java.sql.Types.BIGINT)
+                    } else {
+                        stmt.setLong(setIndex, row.getLong(rowIndex))
+                    }
+                case DoubleType =>
+                    if (row.isNullAt(rowIndex)) {
+                        stmt.setNull(setIndex, java.sql.Types.DOUBLE)
+                    } else {
+                        stmt.setDouble(setIndex, row.getDouble(rowIndex))
+                    }
+                case FloatType =>
+                    if (row.isNullAt(rowIndex)) {
+                        stmt.setNull(setIndex, java.sql.Types.REAL)
+                    } else {
+                        stmt.setFloat(setIndex, row.getFloat(rowIndex))
+                    }
+                case ShortType =>
+                    if (row.isNullAt(rowIndex)) {
+                        stmt.setNull(setIndex, java.sql.Types.INTEGER)
+                    } else {
+                        stmt.setInt(setIndex, row.getShort(rowIndex))
+                    }
+                case ByteType =>
+                    if (row.isNullAt(rowIndex)) {
+                        stmt.setNull(setIndex, java.sql.Types.INTEGER)
+                    } else {
+                        stmt.setInt(setIndex, row.getByte(rowIndex))
+                    }
+                case BooleanType =>
+                    if (row.isNullAt(rowIndex)) {
+                        stmt.setNull(setIndex, java.sql.Types.BIT)
+                    } else {
+                        stmt.setBoolean(setIndex, row.getBoolean(rowIndex))
+                    }
+                case StringType =>
+                    if (row.isNullAt(rowIndex)) {
+                        stmt.setNull(setIndex, java.sql.Types.CLOB)
+                    } else {
+                        stmt.setString(setIndex, row.getString(rowIndex))
+                    }
+                case BinaryType =>
+                    if (row.isNullAt(rowIndex)) {
+                        stmt.setNull(setIndex, java.sql.Types.BLOB)
+                    } else {
+                        stmt.setBytes(setIndex, row.getAs[Array[Byte]](rowIndex))
+                    }
+                case TimestampType =>
+                    if (row.isNullAt(rowIndex)) {
+                        stmt.setNull(setIndex, java.sql.Types.TIMESTAMP)
+                    } else {
+                        stmt.setTimestamp(setIndex, row.getAs[java.sql.Timestamp](rowIndex))
+                    }
+                case DateType =>
+                    if (row.isNullAt(rowIndex)) {
+                        stmt.setNull(setIndex, java.sql.Types.DATE)
+                    } else {
+                        stmt.setDate(setIndex, row.getAs[java.sql.Date](rowIndex))
+                    }
+                case DecimalType.Unlimited =>
+                    if (row.isNullAt(rowIndex)) {
+                        stmt.setNull(setIndex, java.sql.Types.DECIMAL)
+                    } else {
+                        stmt.setBigDecimal(setIndex, row.getAs[java.math.BigDecimal](rowIndex))
+                    }
+                case _ => throw new IllegalArgumentException(
+                    s"Can't translate non-null value for field $rowIndex")
+            }
+        }
+    }
+
     def updateJDBC(hqlContext : HiveContext,
                    tableName : String,
                    updateSQLStr : String,
                    jdbcURLStr : String,
-                   callbackSQL : String,
+                   callbackSQLStr : String,
                    hql : String) : DataFrame = {
         val npartions = Math.abs(hqlContext.getConf("anystream.dataframe.partitions", "0").toInt)
         val df = if (npartions == 0) { hqlContext.sql(hql) } else { hqlContext.sql(hql).coalesce(npartions) }
 
-        val jdbcURL = jdbcURLStr.replaceAll("""\\;""", """;""")
-        val (updateSqlPrefix, updateSQL) = if (jdbcURL.trim.toLowerCase.startsWith("jdbc:phoenix")) {
-            (s"UPSERT INTO $tableName", " " + updateSQLStr)
-        } else {
-            (s"UPDATE $tableName ", "SET " + updateSQLStr)
-        }
+        val formatStub = """((?<!%)%\d+)""".r
+        val formatCtor = """\?"""
 
-        val callback = if (callbackSQL != null) {
-            callbackSQL.replaceAll( """\\'""", """'""").split( """\\;""").filter(!_.trim.isEmpty)
+        val jdbcURL = jdbcURLStr.replaceAll("""\\;""", """;""")
+        val updateSQLMatcher = if (jdbcURL.trim.toLowerCase.startsWith("jdbc:phoenix")) {
+            s"UPSERT INTO $tableName" + " " + updateSQLStr
+        } else {
+            s"UPDATE $tableName " + "SET " + updateSQLStr
+        }
+        logInfo(s"update external databases $jdbcURL : $updateSQLMatcher")
+        val updateSQLPattern = formatStub.replaceAllIn(updateSQLMatcher, formatCtor).format("")
+        val updateSQLSetRule = formatStub.findAllIn(updateSQLMatcher).toList.map(_.filter(_.isDigit)).zipWithIndex
+                .map(pair => (pair._2 + 1, pair._1.toInt - 1))
+
+        val callbackSQL = if (callbackSQLStr != null) {
+            val sqlsList = callbackSQLStr.replaceAll( """\\'""", """'""").split( """\\;""").filterNot(_.trim.isEmpty)
+            for ( sqlStr <- sqlsList) yield {
+                logInfo(s"callback of updating external databases $jdbcURL : $sqlStr")
+                val sqlPattern = formatStub.replaceAllIn(sqlStr, formatCtor).format("")
+                val sqlSetRule = formatStub.findAllIn(sqlStr).toList.map(_.filter(_.isDigit)).zipWithIndex
+                        .map(pair => (pair._2 + 1, pair._1.toInt - 1))
+                (sqlPattern, sqlSetRule)
+            }
         } else {
             null
         }
 
-        val schema = df.schema.fields
+//        val schema = df.schema.fields
+//        logInfo("updateJDBC dataframe schema : " + schema.mkString("[", ", ", "]"))
         val linesPerTransaction = Math.abs(hqlContext.getConf("anystream.jdbc.transaction.size", "0").toLong)
         df.rdd.foreachPartition(part => {
-            val formatStub = """((?<!%)%\d+)""".r
-            val formatCtor = """$1\$s"""
-//            var conn : Connection = null
-//            var stmt : Statement = null
             val conn = DriverManager.getConnection(jdbcURL)
             var committed = false
             var sqlClause = ""
             try {
                 conn.setAutoCommit(false)
-                val stmt = conn.createStatement()
+                val updateStmt = conn.prepareStatement(updateSQLPattern)
+                val callbackStmt = if (callbackSQL != null) {
+                    callbackSQL.map(pair => (conn.prepareStatement(pair._1), pair._1, pair._2))
+                } else {
+                    null
+                }
                 try {
                     var lines = 0L
                     while (part.hasNext) {
                         val row = part.next()
-                        val rowList = (
-                                for (ix <- 0 until row.length) yield {
-                                    schema(ix).dataType match {
-                                        case StringType =>
-                                            if(row.isNullAt(ix)) {
-                                                "NULL"
-                                            } else {
-                                                val str = row(ix).toString.replaceAll("""'""", """\\'""")
-                                                "'" + str + "'"
-                                            }
-                                        case _ => if (row.isNullAt(ix)) "NULL" else row(ix).toString
-                                    }
-                                }
-                                ).toList
-                        val updateStatement = formatStub.replaceAllIn(updateSqlPrefix, formatCtor).format(rowList: _*) +
-                                formatStub.replaceAllIn(updateSQL, formatCtor).format(rowList: _*)
-                        sqlClause = updateStatement
-                        val updatedRows = stmt.executeUpdate(updateStatement)
-                        if (updatedRows == 0 && callback != null) {
-                            callback.map(str =>
-                                formatStub.replaceAllIn(str, formatCtor).format(rowList: _*)
-                            ).foreach(sql => {
-                                sqlClause = sql
-                                stmt.execute(sql)
+                        sqlClause = "prepareStatement : " + updateSQLPattern + "\n" +
+                                "rule : " + updateSQLSetRule.mkString("[", ", ", "]") + "\n" +
+                                "row : " + row.mkString("[", ", ", "]") + "\n" +
+                                "row schema : " + row.schema.fields.mkString("[", ", ", "]")
+                        logDebug(s"update content : $sqlClause")
+                        setStatement(updateStmt, updateSQLSetRule, row)
+                        val updatedRows = updateStmt.executeUpdate()
+                        if (updatedRows == 0 && callbackStmt != null) {
+                            callbackStmt.foreach(pair => {
+                                val (stmt, pattern, rule) = pair
+                                sqlClause = "prepareStatement : " + pattern + "\n" +
+                                        "rule : " + rule.mkString("[", ", ", "]") + "\n" +
+                                        "row : " + row.mkString("[", ", ", "]") + "\n" +
+                                        "row schema : " + row.schema.fields.mkString("[", ", ", "]")
+                                logDebug(s"callback content : $sqlClause")
+                                setStatement(stmt, rule, row)
+                                stmt.executeUpdate()
                             })
                         }
                         lines += 1
@@ -479,15 +570,16 @@ object  ETL extends Logging {
                         }
                     }
                 } finally {
-                    stmt.close()
+                    updateStmt.close()
+                    if (callbackStmt != null) {
+                        callbackStmt.map(_._1).foreach(_.close())
+                    }
                 }
                 conn.commit()
                 committed = true
             } catch {
                 case e: SQLException => logWarning(s"update JDBC exception $sqlClause : ", e)
             }finally {
-//                if (stmt != null) stmt.close()
-//                if (conn != null) conn.close()
                 if (!committed) {
                     // The stage must fail.  We got here through an exception path, so
                     // let the exception through unless rollback() or close() want to
@@ -576,8 +668,8 @@ object  ETL extends Logging {
         hql match {
             case jdbcInsertMatcher(tableName, jdbcURL, trNo1, trNo1Sql, trNo2, trNo2Sql, sql) =>
                 writeJDBC(hqlContext, tableName, jdbcURL, trNo1, trNo1Sql, trNo2, trNo2Sql, sql.trim)
-            case jdbcUpdateMatcher(tableName, updateSql, jdbcURL, callbackSql, sql) =>
-                updateJDBC(hqlContext, tableName, updateSql, jdbcURL, callbackSql, sql.trim)
+            case jdbcUpdateMatcher(tableName, updateSql, jdbcURL, callbackSQLStr, sql) =>
+                updateJDBC(hqlContext, tableName, updateSql, jdbcURL, callbackSQLStr, sql.trim)
             case metaqMatcher(metaqURL, sql) => writeMetaQ(hqlContext, metaqURL, sql)
             case jsonMatcher(jsonTableName, sql) => createJsonTable(hqlContext, jsonTableName, sql.trim)
 //            case esMatcher(esURL, sql)       => writeES(hqlContext, esURL, sql)
@@ -762,12 +854,13 @@ object  ETL extends Logging {
                 """.stripMargin
             val statAnalysisSql =
                 s"""
-                  | SELECT  'merger'         AS vendor
-                  |       , '$metaqTopic'  AS topic
+                  | SELECT  cast(NULL AS INT) AS id
+                  |       , 'merger'          AS vendor
+                  |       , '$metaqTopic'     AS topic
                   |       , interface
                   |       , hostip
-                  |       , sum(sendbyte)    AS sendbyte
-                  |       , count(*)         AS linenum
+                  |       , sum(sendbyte)     AS sendbyte
+                  |       , count(*)          AS linenum
                   |       , sendtime
                   | FROM ( SELECT   interface
                   |               , concat_ws(':', host[1], host[2]) AS hostip
@@ -776,7 +869,8 @@ object  ETL extends Logging {
                   |        FROM `__stat_data__` ) tmp
                   | GROUP BY interface, hostip, sendtime
                 """.stripMargin
-            asDFStream.foreachRDD(rdd => {
+            val statWindow = Seconds(Math.ceil(60.0 / streamingInterval).toInt * streamingInterval)
+            asDFStream.window(statWindow, statWindow).foreachRDD(rdd => {
                 val hqlContext = getInstance(rdd.sparkContext)
                 import hqlContext.implicits._
                 rdd.toDF().registerTempTable("__stat__")

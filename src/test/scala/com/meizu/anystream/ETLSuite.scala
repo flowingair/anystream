@@ -8,9 +8,11 @@ import org.apache.spark.{SparkContext, SparkConf, Logging}
 import org.apache.spark.sql.hive.HiveContext
 import org.junit.runner.RunWith
 import org.scalatest.junit.JUnitRunner
+//import org.apache.spark.sql.hive.test._
 
 @RunWith(classOf[JUnitRunner])
 class ETLSuite extends FunSuite with ShouldMatchers{
+
     ignore("parse hql file") {
         val root = System.getProperty("user.dir")
         ETL.isDebugMode = true
@@ -100,11 +102,11 @@ class ETLSuite extends FunSuite with ShouldMatchers{
             case _ => ("", "", "", "")
         }
 
-//        println(tableName)
-//        println(setClause)
-//        println(jdbcUrl)
-//        println(hql)
-//        println(callback)
+        println(tableName)
+        println(setClause)
+        println(jdbcUrl)
+        println(hql)
+        println(callback)
         tableName should be ("tableName")
         jdbcUrl should be ("jdbc:mysql://ip:host/db?user=orion&password=12345")
         setClause should be ("col1 = %1, col2 = %3 WHERE col3 in (%3)")
@@ -141,8 +143,9 @@ class ETLSuite extends FunSuite with ShouldMatchers{
             """
               |SET col1 = %1, col2 = %3, col%%4 = %5 WHERE col3 in (%3)
             """.stripMargin
-        val replacedStr = str.replaceAll("""((?<!%)%\d+)""", """$1\$s""") //.replaceAll("%%", "%")
-        val result = replacedStr.format(List("A", "B", "C", "D", "E"): _*)
+        val replacedStr = str.replaceAll("""((?<!%)%\d+)""", """\?""") //.replaceAll("%%", "%")
+//        val result = replacedStr.format(List("A", "B", "C", "D", "E"): _*)
+        val result = replacedStr.format("")
         println(replacedStr)
         println(result)
     }
@@ -168,14 +171,21 @@ class ETLSuite extends FunSuite with ShouldMatchers{
     }
 
     ignore("test updateJDBC") {
-        val sConf = new SparkConf().setMaster("local[*]").setAppName("Anystream-Framework-Test")
-        val sCtxt = new SparkContext(sConf)
-        val hqlCtxt = new HiveContext(sCtxt)
+        if (System.getProperty("os.name").toLowerCase.contains("windows")) {
+            System.setProperty( """hadoop.home.dir""", """D:\hadoop-2.2.0""")
+        }
+        val hqlCtxt = new HiveContext(
+            new SparkContext("local[2]", "ANYSTREAM-FRAMEWORK-TEST",
+                new SparkConf()
+                //                .set("spark.sql.test", "")
+                //                .set("spark.sql.hive.metastore.barrierPrefixes", "org.apache.spark.sql.hive.execution.PairSerDe")
+            )
+        )
         val hqlEx = Array(
             """CREATE TEMPORARY TABLE ServiceMetric
               |USING org.apache.spark.sql.json
               |AS
-              |SELECT '{"state" : [{"id":"0", "ap":"ap", "k1":"k1", "k2":"k2", "k3":"1270010010010", "vs":[0, 0, 0, 0, 0, 0]}], "ip":"127001001001", "t":"0"}';
+              |SELECT '{"state" : [{"id":"0", "ap":"ap", "k1":"k1", "k2":"k2", "k3":"1270010010010", "vs":[0, 0, 0, 0, 0, 0]}], "ip":"127001001001", "t":"0"}'
               |""".stripMargin ,
             """SELECT  stat.ap as appName
               |      , stat.k1 as service
@@ -249,7 +259,5 @@ class ETLSuite extends FunSuite with ShouldMatchers{
         ETL.executeHql(hqlCtxt, hqlEx(0))
         ETL.executeHql(hqlCtxt, hqlEx(1)).registerTempTable("StatesDetail")
         ETL.executeHql(hqlCtxt, hqlEx(2))
-
-        sCtxt.stop()
     }
 }
