@@ -19,4 +19,6 @@ anystream.stat.output.url                        jdbc:mysql://host:port/database
 anystream.stat.output.table                      T_ANYSTREAM_STAT
 anystream.stat.interfaces                        interfaces1,interfaces2,interfaces3
 
+anystream.mergefile.size
+
 //anystream.jdbc.transaction.size                 0

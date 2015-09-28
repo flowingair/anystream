@@ -39,6 +39,19 @@ class ETLSuite extends FunSuite with ShouldMatchers{
         jdbcURL should be ("jdbc:mysql://172.16.10.235:3306/MEIZU_DB_ORION?user=mysqluser&password=mysqluser")
     }
 
+    test("a mergeMatcher should extract clause of merging into destination directory from source directory") {
+        val str =
+        """MERGE INTO DIRECTORY '/user/hive/tmp/as_uxip' FROM '/user/hive/warehouse/anystream_uxip.db/bdl_fdt_uxip_events'"""
+        val (dest, src) = str match {
+            case ETL.mergeMatcher(dir1, dir2) => (dir1, dir2)
+            case _=> (" ", " ")
+        }
+        println(dest)
+        println(src)
+        dest should be ("/user/hive/tmp/as_uxip")
+        src  should be ("/user/hive/warehouse/anystream_uxip.db/bdl_fdt_uxip_events")
+    }
+
     test("a jsonMatcher should extract clause of creating jsonTable from stringTable") {
         val str =
             """

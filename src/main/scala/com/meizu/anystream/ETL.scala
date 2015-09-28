@@ -20,6 +20,10 @@ import com.google.protobuf.InvalidProtocolBufferException
 
 import org.rogach.scallop.{ScallopOption, ScallopConf}
 
+import org.apache.hadoop.fs.{Path, FileSystem}
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.io.IOUtils
+
 import org.apache.spark.sql._
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.hive.HiveContext
@@ -76,6 +80,11 @@ object  ETL extends Logging {
             """(?s)^\s*[iI][nN][sS][eE][rR][tT]\s+[iI][nN][tT][oO]\s+""" +
             """[dD][iI][rR][eE][cC][tT][oO][rR][yY]\s+""" +
             """'([mM][eE][tT][aA][qQ]:.*?)'\s+(.*)""").r
+    final val mergeMatcher = (
+            """(?s)^\s*[mM][eE][rR][gG][eE]\s+[iI][nN][tT][oO]\s+""" +
+            """[dD][iI][rR][eE][cC][tT][oO][rR][yY]\s+""" +
+            """'(.*?)'\s+[fF][rR][oO][mM]\s+'(.*?)'\s*"""
+            ).r
     final val jdbcInsertMatcher = (
             """(?s)^\s*[iI][nN][sS][eE][rR][tT]\s+[iI][nN][tT][oO]\s+[tT][aA][bB][lL][eE]\s+""" + """(.+?)\s+""" +
             """[uU][sS][iI][nN][gG]\s+'([jJ][dD][bB][cC]:.*?)'\s*""" +
@@ -108,6 +117,8 @@ object  ETL extends Logging {
     final val minutePartitionMatcher = """([\d]*)?[m|M]""".r
 
     final var isDebugMode = false
+
+    final var mergeFileName: String = null
 
 
     // Instantiate HiveContext on demand
@@ -231,6 +242,13 @@ object  ETL extends Logging {
                     .setSendTimestamp(System.currentTimeMillis())
                     .setCompression(0)
                     .build().toByteArray
+            })
+            instance.udf.register("array_bytes", (seq : scala.collection.Seq[Array[Byte]]) => {
+                if ( seq != null) {
+                    seq.map(_.size).sum
+                } else {
+                    0
+                }
             })
         }
         instance
@@ -502,7 +520,8 @@ object  ETL extends Logging {
         val formatCtor = """\?"""
 
         val jdbcURL = jdbcURLStr.replaceAll("""\\;""", """;""")
-        val updateSQLMatcher = if (jdbcURL.trim.toLowerCase.startsWith("jdbc:phoenix")) {
+        val isPhoenixDriver = jdbcURL.trim.toLowerCase.startsWith("jdbc:phoenix")
+        val updateSQLMatcher = if (isPhoenixDriver) {
             s"UPSERT INTO $tableName" + " " + updateSQLStr
         } else {
             s"UPDATE $tableName " + "SET " + updateSQLStr
@@ -525,15 +544,26 @@ object  ETL extends Logging {
             null
         }
 
+        val isAutoCommit = if (isPhoenixDriver && callbackSQLStr != null) true else false
+        if (isAutoCommit) {
+            logInfo("auto commit has already turned on")
+        }
+
 //        val schema = df.schema.fields
 //        logInfo("updateJDBC dataframe schema : " + schema.mkString("[", ", ", "]"))
-        val linesPerTransaction = Math.abs(hqlContext.getConf("anystream.jdbc.transaction.size", "0").toLong)
+//        val linesPerTransaction = Math.abs(hqlContext.getConf("anystream.jdbc.transaction.size", "0").toLong)
         df.rdd.foreachPartition(part => {
             val conn = DriverManager.getConnection(jdbcURL)
             var committed = false
             var sqlClause = ""
             try {
-                conn.setAutoCommit(false)
+                if (isAutoCommit) {
+                    conn.setAutoCommit(true)
+                    committed = true
+                } else {
+                    conn.setAutoCommit(false)
+                    committed = false
+                }
                 val updateStmt = conn.prepareStatement(updateSQLPattern)
                 val callbackStmt = if (callbackSQL != null) {
                     callbackSQL.map(pair => (conn.prepareStatement(pair._1), pair._1, pair._2))
@@ -541,7 +571,7 @@ object  ETL extends Logging {
                     null
                 }
                 try {
-                    var lines = 0L
+//                    var lines = 0L
                     while (part.hasNext) {
                         val row = part.next()
                         sqlClause = "prepareStatement : " + updateSQLPattern + "\n" +
@@ -563,11 +593,11 @@ object  ETL extends Logging {
                                 stmt.executeUpdate()
                             })
                         }
-                        lines += 1
-                        if (linesPerTransaction != 0 && lines >= linesPerTransaction) {
-                            conn.commit()
-                            lines = 0
-                        }
+//                        lines += 1
+//                        if (linesPerTransaction != 0 && lines >= linesPerTransaction) {
+//                            conn.commit()
+//                            lines = 0
+//                        }
                     }
                 } finally {
                     updateStmt.close()
@@ -575,8 +605,10 @@ object  ETL extends Logging {
                         callbackStmt.map(_._1).foreach(_.close())
                     }
                 }
-                conn.commit()
-                committed = true
+                if (!isAutoCommit) {
+                    conn.commit()
+                    committed = true
+                }
             } catch {
                 case e: SQLException => logWarning(s"update JDBC exception $sqlClause : ", e)
             }finally {
@@ -664,6 +696,79 @@ object  ETL extends Logging {
         jsonDF
     }
 
+    private def copyMerge(srcFS : FileSystem, srcDir : Path, dstFS : FileSystem, dstFile: Path,
+                                        deleteSource : Boolean, conf : Configuration) : Boolean = {
+        if (srcDir == null || !srcFS.getFileStatus(srcDir).isDirectory) {
+            logError(s"${srcDir.toString} must be a valid directory")
+            return false
+        }
+
+        val out = if (dstFS.exists(dstFile)) {
+            dstFS.append(dstFile)
+        } else {
+            dstFS.create(dstFile)
+        }
+
+        try {
+            val contents = srcFS.listStatus(srcDir)
+//          Arrays.sort(contents);
+            for ( i <- 0 until contents.length) {
+                if (contents(i).isFile) {
+                    val in = srcFS.open(contents(i).getPath)
+                    try {
+                        IOUtils.copyBytes(in, out, conf, false)
+                    } finally {
+                        in.close()
+                    }
+                }
+            }
+        } finally {
+            out.close()
+        }
+
+        if (deleteSource) {
+            srcFS.delete(srcDir, true)
+            srcFS.mkdirs(srcDir)
+        } else {
+            true
+        }
+    }
+
+    private def getTimeTag : String = {
+        val ts = System.currentTimeMillis()
+        val dt = new Date(ts)
+        val dtFormater = new SimpleDateFormat("yyyyMMddHHmmss")
+        dtFormater.format(dt)
+    }
+
+    def mergeFiles(hqlContext: HiveContext, src : String, dst : String) : DataFrame = {
+        val sparkContext = hqlContext.sparkContext
+        val applicationId = sparkContext.applicationId
+        val hadoopConfig = sparkContext.hadoopConfiguration
+        val mergeFileSize = System.getProperty("anystream.mergefile.size", (1024L*1024L*1024L).toString).toLong
+        if (hadoopConfig == null) {
+            logError("can not get hadoop configuration")
+            return hqlContext.emptyDataFrame
+        }
+        val fs = FileSystem.get(hadoopConfig)
+        val srcPath = new Path(src)
+        val timeTag = getTimeTag
+        val path = if (mergeFileName == null) {
+            mergeFileName = s"$dst/${timeTag.take(8)}/$applicationId-$timeTag"
+            new Path(mergeFileName)
+        } else {
+            new Path(mergeFileName)
+        }
+        val dstPath = if (fs.exists(path) && fs.getFileStatus(path).getLen < mergeFileSize) {
+            path
+        } else {
+            mergeFileName = s"$dst/${timeTag.take(8)}/$applicationId-$timeTag"
+            new Path(mergeFileName)
+        }
+        copyMerge(fs,srcPath, fs, dstPath, deleteSource = true, hadoopConfig)
+        hqlContext.emptyDataFrame
+    }
+
     def executeHql(hqlContext: HiveContext, hql : String): DataFrame = {
         hql match {
             case jdbcInsertMatcher(tableName, jdbcURL, trNo1, trNo1Sql, trNo2, trNo2Sql, sql) =>
@@ -675,6 +780,7 @@ object  ETL extends Logging {
 //            case esMatcher(esURL, sql)       => writeES(hqlContext, esURL, sql)
             case jdbcLoadMatcher(sparkTable, jdbcTable, jdbcURL) =>
                 loadFromJDBC(hqlContext, sparkTable, jdbcTable, jdbcURL)
+//            case mergeMatcher(dstDir, srcDir) => mergeFiles(hqlContext, srcDir, dstDir)
             case _ => hqlContext.sql(hql)
         }
     }
@@ -848,9 +954,10 @@ object  ETL extends Logging {
                 """
                   | SELECT  interface
                   |       , split(coalesce(ext_domain['ip'], 'Unknown'), ':')  AS host
-                  |       , length(utf8(one_row))  AS sendbyte
+                  |       , array_bytes(data)  AS sendbyte
+                  |       , size(data)         AS linenum
                   |       , send_timestamp
-                  | FROM `__stat_input__` LATERAL VIEW explode(data) mutli_rows AS one_row
+                  | FROM `__stat_input__`
                 """.stripMargin
             val statAnalysisSql =
                 s"""
@@ -860,12 +967,13 @@ object  ETL extends Logging {
                   |       , interface
                   |       , hostip
                   |       , sum(sendbyte)     AS sendbyte
-                  |       , count(*)          AS linenum
+                  |       , sum(linenum)      AS linenum
                   |       , sendtime
                   | FROM ( SELECT   interface
                   |               , concat_ws(':', host[1], host[2]) AS hostip
                   |               , sendbyte
-                  |               , partitioner(send_timestamp, 'm') AS sendtime
+                  |               , linenum
+                  |               , partitioner('m', send_timestamp) AS sendtime
                   |        FROM `__stat_data__` ) tmp
                   | GROUP BY interface, hostip, sendtime
                 """.stripMargin
