@@ -1,6 +1,8 @@
 package com.meizu.anystream
 
-import sun.misc.{Signal, SignalHandler}
+import java.net.URI
+
+import sun.misc.{BASE64Encoder, Signal, SignalHandler}
 import java.nio.charset.Charset
 import java.security.MessageDigest
 import java.util.zip.GZIPInputStream
@@ -27,7 +29,7 @@ import org.apache.hadoop.io.IOUtils
 import org.apache.spark.sql._
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.hive.HiveContext
-import org.apache.spark.{SparkContext, SparkConf, Logging}
+import org.apache.spark.{TaskContext, SparkContext, SparkConf, Logging}
 import org.apache.spark.streaming.{Seconds, StreamingContext}
 
 import com.taobao.metamorphosis.Message
@@ -80,11 +82,10 @@ object  ETL extends Logging {
             """(?s)^\s*[iI][nN][sS][eE][rR][tT]\s+[iI][nN][tT][oO]\s+""" +
             """[dD][iI][rR][eE][cC][tT][oO][rR][yY]\s+""" +
             """'([mM][eE][tT][aA][qQ]:.*?)'\s+(.*)""").r
-    final val mergeMatcher = (
-            """(?s)^\s*[mM][eE][rR][gG][eE]\s+[iI][nN][tT][oO]\s+""" +
+    final val hdfsMatcher = (
+            """(?s)^\s*[iI][nN][sS][eE][rR][tT]\s+[iI][nN][tT][oO]\s+""" +
             """[dD][iI][rR][eE][cC][tT][oO][rR][yY]\s+""" +
-            """'(.*?)'\s+[fF][rR][oO][mM]\s+'(.*?)'\s*"""
-            ).r
+            """'([hH][dD][fF][sS]:.*?)'\s+(.*)""").r
     final val jdbcInsertMatcher = (
             """(?s)^\s*[iI][nN][sS][eE][rR][tT]\s+[iI][nN][tT][oO]\s+[tT][aA][bB][lL][eE]\s+""" + """(.+?)\s+""" +
             """[uU][sS][iI][nN][gG]\s+'([jJ][dD][bB][cC]:.*?)'\s*""" +
@@ -110,7 +111,7 @@ object  ETL extends Logging {
             """[uU][sS][iI][nN][gG]\s+'([jJ][dD][bB][cC]:.*?)'\s*""").r
 
     final val metaqURLExtractor = """[mM][eE][tT][aA][qQ]://([^/]*)/([^/\?]*)(?:\?(.*))?""".r
-//    final val jdbcURLExtractor = """(.*)/([^/\?]*)(\?.*)?""".r
+    final val hdfsURLExtractor  = """([^:/]+://)([^/]*)([^\?]*)(?:\?(.*))?""".r
     final val esURLExtractor = """[eE][sS]://([^/\?]*)""".r
     final val dayPartitionMatcher = """([\d]*)?[d|D]""".r
     final val hourPartitionMatcher = """([\d]*)?[h|H]""".r
@@ -119,6 +120,8 @@ object  ETL extends Logging {
     final var isDebugMode = false
 
     final var mergeFileName: String = null
+
+    final val fsSinkPaths =  scala.collection.mutable.Map.empty[String, Array[String]]
 
 
     // Instantiate HiveContext on demand
@@ -696,44 +699,6 @@ object  ETL extends Logging {
         jsonDF
     }
 
-    private def copyMerge(srcFS : FileSystem, srcDir : Path, dstFS : FileSystem, dstFile: Path,
-                                        deleteSource : Boolean, conf : Configuration) : Boolean = {
-        if (srcDir == null || !srcFS.getFileStatus(srcDir).isDirectory) {
-            logError(s"${srcDir.toString} must be a valid directory")
-            return false
-        }
-
-        val out = if (dstFS.exists(dstFile)) {
-            dstFS.append(dstFile)
-        } else {
-            dstFS.create(dstFile)
-        }
-
-        try {
-            val contents = srcFS.listStatus(srcDir)
-//          Arrays.sort(contents);
-            for ( i <- 0 until contents.length) {
-                if (contents(i).isFile) {
-                    val in = srcFS.open(contents(i).getPath)
-                    try {
-                        IOUtils.copyBytes(in, out, conf, false)
-                    } finally {
-                        in.close()
-                    }
-                }
-            }
-        } finally {
-            out.close()
-        }
-
-        if (deleteSource) {
-            srcFS.delete(srcDir, true)
-            srcFS.mkdirs(srcDir)
-        } else {
-            true
-        }
-    }
-
     private def getTimeTag : String = {
         val ts = System.currentTimeMillis()
         val dt = new Date(ts)
@@ -741,31 +706,117 @@ object  ETL extends Logging {
         dtFormater.format(dt)
     }
 
-    def mergeFiles(hqlContext: HiveContext, src : String, dst : String) : DataFrame = {
-        val sparkContext = hqlContext.sparkContext
-        val applicationId = sparkContext.applicationId
-        val hadoopConfig = sparkContext.hadoopConfiguration
-        val mergeFileSize = System.getProperty("anystream.mergefile.size", (1024L*1024L*1024L).toString).toLong
-        if (hadoopConfig == null) {
-            logError("can not get hadoop configuration")
-            return hqlContext.emptyDataFrame
-        }
-        val fs = FileSystem.get(hadoopConfig)
-        val srcPath = new Path(src)
+    private def getPaths(applicationId : String,
+                         fs : String,
+                         dir: String,
+                         argumentList : Map[String, String]) : Array[String] = {
+        val fsURI = URI.create(fs)
+        val hadoopConf = new Configuration()
+        val filesystem = FileSystem.get(fsURI, hadoopConf)
+        val argument = argumentList.map(pair => pair._1 + "=" + pair._2).mkString("?", "&", "")
+        val sizeThreshold = argumentList.getOrElse("size_threshold", (1024L * 1024L * 1024L).toString).toLong
+        val partition = argumentList.getOrElse("partition", "false").toBoolean
+        val concurrent = argumentList.getOrElse("concurrent", 2.toString).toInt
+        val dstDir = fs + dir + "?" + argument
         val timeTag = getTimeTag
-        val path = if (mergeFileName == null) {
-            mergeFileName = s"$dst/${timeTag.take(8)}/$applicationId-$timeTag"
-            new Path(mergeFileName)
-        } else {
-            new Path(mergeFileName)
+        val ymd = timeTag.take(8)
+        val updatedPaths = fsSinkPaths.get(dstDir) match {
+            case Some(paths) => paths.zipWithIndex.map(pair => {
+                val (str, index) = pair
+                val path = new Path(str)
+                if (filesystem.exists(path) && filesystem.getFileStatus(path).getLen <= sizeThreshold) {
+                    str
+                } else {
+                    if (partition) {
+                        s"$dir/stat_date=$ymd/${applicationId}__${index}_$timeTag"
+                    } else {
+                        s"$dir/${applicationId}__${index}_$timeTag"
+                    }
+                }
+            })
+            case None => if (partition) {
+                Range(0, concurrent).toArray.map(index => s"$dir/stat_date=$ymd/${applicationId}__${index}_$timeTag")
+            } else {
+                Range(0, concurrent).toArray.map(index => s"$dir/${applicationId}__${index}_$timeTag")
+            }
         }
-        val dstPath = if (fs.exists(path) && fs.getFileStatus(path).getLen < mergeFileSize) {
-            path
-        } else {
-            mergeFileName = s"$dst/${timeTag.take(8)}/$applicationId-$timeTag"
-            new Path(mergeFileName)
+        fsSinkPaths(dstDir) = updatedPaths
+        updatedPaths
+    }
+
+    private def row2String(row : Row, separator : Int = 0x01) : String = {
+        val schema = row.schema.fields.zipWithIndex
+        val arr = schema.map(pair => {
+            val (field, index) = pair
+            field.dataType match {
+                case ByteType    => if (row.isNullAt(index)) """\N""" else row.getByte(index).toString
+                case ShortType   => if (row.isNullAt(index)) """\N""" else row.getShort(index).toString
+                case IntegerType => if (row.isNullAt(index)) """\N""" else row.getInt(index).toString
+                case LongType    => if (row.isNullAt(index)) """\N""" else row.getLong(index).toString
+                case FloatType   => if (row.isNullAt(index)) """\N""" else row.getFloat(index).toString
+                case DoubleType  => if (row.isNullAt(index)) """\N""" else row.getDouble(index).toString
+                case BooleanType => if (row.isNullAt(index)) """\N""" else row.getBoolean(index).toString
+                case StringType  => if (row.isNullAt(index)) """\N""" else row.getString(index)
+                case BinaryType  => if (row.isNullAt(index)) """\N""" else {
+                    val bytes = row.getSeq[Byte](index).toArray
+                    val encoder = new BASE64Encoder()
+                    encoder.encode(bytes)
+                }
+                case ArrayType(eleType, nullable)   => if (row.isNullAt(index)) """\N""" else {
+                    val arr = row.getSeq[Any](index)
+                    arr.map(ele => row2String(Row(ele), separator + 1)).mkString((separator + 1).toChar.toString)
+                }
+                case MapType(_, _, _)  => if (row.isNullAt(index)) """\N""" else {
+                    val mapInstance = row.getMap[Any, Any](index)
+                    mapInstance.map(pair => {
+                        val (key, value) = pair
+                        row2String(Row(key), separator + 2) +
+                        (separator + 2).toChar.toString +
+                        row2String(Row(value), separator + 2)
+                    }).mkString((separator + 1).toChar.toString)
+                }
+                case StructType(_)     => if (row.isNullAt(index)) """\N""" else {
+                    row2String(row.getStruct(index), separator + 1)
+                }
+            }
+        })
+        arr.mkString(separator.toChar.toString)
+    }
+
+    def writeHDFS(hqlContext: HiveContext, dstURL : String, hql : String) : DataFrame = {
+        val (schema, fsAddr, dir, argument) = dstURL match {
+            case ETL.hdfsURLExtractor(prefix, addr, dirStr, argumentStr) => (prefix, addr, dirStr, argumentStr)
         }
-        copyMerge(fs,srcPath, fs, dstPath, deleteSource = true, hadoopConfig)
+        val fs = if (fsAddr.trim.isEmpty) {
+            hqlContext.sparkContext.hadoopConfiguration.get("fs.defaultFS")
+        } else {
+            schema + fsAddr.trim
+        }
+        val applicationId = hqlContext.sparkContext.applicationId
+        val argumentList = argument.split("&").map(_.split("=")).map(arr => (arr(0).trim, arr(1).trim)).toMap
+        val paths = getPaths(applicationId, fs, dir, argumentList)
+        val concurrent = argumentList.getOrElse("concurrent", 2.toString).toInt
+        val df = hqlContext.sql(hql)
+        df.repartition(concurrent).foreachPartition(part => {
+            val partitionIndex = TaskContext.get().partitionId()
+            val fsURI = URI.create(fs)
+            val hadoopConf = new Configuration()
+            val filesystem = FileSystem.get(fsURI, hadoopConf)
+            val path = new Path(paths(partitionIndex))
+            val output = if (filesystem.exists(path)) filesystem.append(path) else filesystem.create(path)
+            val strBuilder = mutable.StringBuilder.newBuilder
+            while (part.hasNext) {
+                val row = part.next()
+                strBuilder ++= s"${row2String(row)}\n"
+            }
+            try {
+                val bytes = strBuilder.result().getBytes(charset)
+                output.write(bytes, 0, bytes.length)
+            } finally {
+                output.close()
+                filesystem.close()
+            }
+        })
         hqlContext.emptyDataFrame
     }
 
@@ -780,7 +831,7 @@ object  ETL extends Logging {
 //            case esMatcher(esURL, sql)       => writeES(hqlContext, esURL, sql)
             case jdbcLoadMatcher(sparkTable, jdbcTable, jdbcURL) =>
                 loadFromJDBC(hqlContext, sparkTable, jdbcTable, jdbcURL)
-//            case mergeMatcher(dstDir, srcDir) => mergeFiles(hqlContext, srcDir, dstDir)
+            case hdfsMatcher(hdfsURL, hqlStr) => writeHDFS(hqlContext, hdfsURL.trim, hqlStr.trim)
             case _ => hqlContext.sql(hql)
         }
     }
