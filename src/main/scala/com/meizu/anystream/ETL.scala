@@ -744,11 +744,10 @@ object  ETL extends Logging {
         updatedPaths
     }
 
-    private def row2String(row : Row, separator : Int = 0x01) : String = {
-        val schema = row.schema.fields.zipWithIndex
+    private def row2string(row : Row, schema : Array[(DataType, Int)], separator : Int = 0x01) : String = {
         val arr = schema.map(pair => {
-            val (field, index) = pair
-            field.dataType match {
+            val (fieldType, index) = pair
+            fieldType match {
                 case ByteType    => if (row.isNullAt(index)) """\N""" else row.getByte(index).toString
                 case ShortType   => if (row.isNullAt(index)) """\N""" else row.getShort(index).toString
                 case IntegerType => if (row.isNullAt(index)) """\N""" else row.getInt(index).toString
@@ -762,21 +761,24 @@ object  ETL extends Logging {
                     val encoder = new BASE64Encoder()
                     encoder.encode(bytes)
                 }
-                case ArrayType(eleType, nullable)   => if (row.isNullAt(index)) """\N""" else {
+                case ArrayType(eleType, _)   => if (row.isNullAt(index)) """\N""" else {
                     val arr = row.getSeq[Any](index)
-                    arr.map(ele => row2String(Row(ele), separator + 1)).mkString((separator + 1).toChar.toString)
+                    arr.map(ele => {
+                        row2string(Row(ele), Array((eleType, 0)), separator + 1)
+                    }).mkString((separator + 1).toChar.toString)
                 }
-                case MapType(_, _, _)  => if (row.isNullAt(index)) """\N""" else {
+                case MapType(keyType, valueType, _)  => if (row.isNullAt(index)) """\N""" else {
                     val mapInstance = row.getMap[Any, Any](index)
                     mapInstance.map(pair => {
                         val (key, value) = pair
-                        row2String(Row(key), separator + 2) +
+                        row2string(Row(key), Array((keyType, 0)), separator + 2) +
                         (separator + 2).toChar.toString +
-                        row2String(Row(value), separator + 2)
+                        row2string(Row(value), Array((valueType, 0)), separator + 2)
                     }).mkString((separator + 1).toChar.toString)
                 }
-                case StructType(_)     => if (row.isNullAt(index)) """\N""" else {
-                    row2String(row.getStruct(index), separator + 1)
+                case StructType(rowType)     => if (row.isNullAt(index)) """\N""" else {
+                    val rowSchema = rowType.map(_.dataType).zipWithIndex
+                    row2string(row.getStruct(index), rowSchema, separator + 1)
                 }
             }
         })
@@ -797,6 +799,7 @@ object  ETL extends Logging {
         val paths = getPaths(applicationId, fs, dir, argumentList)
         val concurrent = argumentList.getOrElse("concurrent", 2.toString).toInt
         val df = hqlContext.sql(hql)
+        val dfSchema = df.schema.fields.map(_.dataType).zipWithIndex
         df.repartition(concurrent).foreachPartition(part => {
             val partitionIndex = TaskContext.get().partitionId()
             val fsURI = URI.create(fs)
@@ -807,7 +810,7 @@ object  ETL extends Logging {
             val strBuilder = mutable.StringBuilder.newBuilder
             while (part.hasNext) {
                 val row = part.next()
-                strBuilder ++= s"${row2String(row)}\n"
+                strBuilder ++= s"${row2string(row, dfSchema)}\n"
             }
             try {
                 val bytes = strBuilder.result().getBytes(charset)
