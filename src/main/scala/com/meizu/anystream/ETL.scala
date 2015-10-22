@@ -1,6 +1,7 @@
 package com.meizu.anystream
 
 import java.net.URI
+import java.io.ByteArrayInputStream
 
 import sun.misc.{BASE64Encoder, Signal, SignalHandler}
 import java.nio.charset.Charset
@@ -22,7 +23,7 @@ import com.google.protobuf.InvalidProtocolBufferException
 
 import org.rogach.scallop.{ScallopOption, ScallopConf}
 
-import org.apache.hadoop.fs.{Path, FileSystem}
+import org.apache.hadoop.fs.{FSDataOutputStream, Path, FileSystem}
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.io.IOUtils
 
@@ -713,7 +714,7 @@ object  ETL extends Logging {
         val fsURI = URI.create(fs)
         val hadoopConf = new Configuration()
         val filesystem = FileSystem.get(fsURI, hadoopConf)
-        val argument = argumentList.map(pair => pair._1 + "=" + pair._2).mkString("?", "&", "")
+        val argument = argumentList.map(pair => pair._1 + "=" + pair._2).mkString("&")
         val sizeThreshold = argumentList.getOrElse("size_threshold", (1024L * 1024L * 1024L).toString).toLong
         val partition = argumentList.getOrElse("partition", "false").toBoolean
         val concurrent = argumentList.getOrElse("concurrent", 2.toString).toInt
@@ -804,20 +805,28 @@ object  ETL extends Logging {
             val partitionIndex = TaskContext.get().partitionId()
             val fsURI = URI.create(fs)
             val hadoopConf = new Configuration()
-            val filesystem = FileSystem.get(fsURI, hadoopConf)
-            val path = new Path(paths(partitionIndex))
-            val output = if (filesystem.exists(path)) filesystem.append(path) else filesystem.create(path)
             val strBuilder = mutable.StringBuilder.newBuilder
-            while (part.hasNext) {
-                val row = part.next()
-                strBuilder ++= s"${row2string(row, dfSchema)}\n"
-            }
+            var out : FSDataOutputStream = null
+            var in : ByteArrayInputStream = null
+            val bufferSize = 1024 * 1024
             try {
-                val bytes = strBuilder.result().getBytes(charset)
-                output.write(bytes, 0, bytes.length)
+                val path = new Path(paths(partitionIndex))
+                val filesystem  = FileSystem.get(fsURI, hadoopConf)
+                if (!filesystem.exists(path)) { filesystem.create(path).close() }
+                out = filesystem.append(path)
+                while (part.hasNext) {
+                    val row = part.next()
+                    strBuilder ++= s"${row2string(row, dfSchema)}\n"
+                }
+                in = new ByteArrayInputStream(strBuilder.result().getBytes("UTF-8"))
+                IOUtils.copyBytes(in, out, bufferSize)
+            } catch {
+                case e: Throwable =>
+                    val pathStr = paths.mkString("[", ", ", "]")
+                    logWarning(s"can not write into the No. $partitionIndex file in $pathStr :", e)
             } finally {
-                output.close()
-                filesystem.close()
+                if (in != null) { IOUtils.closeStream(in) }
+                if (out != null) { IOUtils.closeStream(out)}
             }
         })
         hqlContext.emptyDataFrame
