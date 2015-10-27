@@ -726,7 +726,15 @@ object  ETL extends Logging {
                 val (str, index) = pair
                 val path = new Path(str)
                 if (filesystem.exists(path) && filesystem.getFileStatus(path).getLen <= sizeThreshold) {
-                    str
+                    var newStr = str
+                    if (partition) {
+                        val currentPartition = path.getParent.getName
+                        val expectedPartition = s"stat_date=$ymd"
+                        if (currentPartition != expectedPartition) {
+                            newStr = s"$dir/$expectedPartition/${applicationId}__${index}_$timeTag"
+                        }
+                    }
+                    newStr
                 } else {
                     if (partition) {
                         s"$dir/stat_date=$ymd/${applicationId}__${index}_$timeTag"
