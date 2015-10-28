@@ -1025,7 +1025,7 @@ object  ETL extends Logging {
                 """
                   | SELECT  interface
                   |       , split(coalesce(ext_domain['ip'], 'Unknown'), ':')  AS host
-                  |       , array_bytes(data)  AS sendbyte
+                  |       , array_bytes(data) + size(coalesce(data, array()))  AS sendbyte
                   |       , size(data)         AS linenum
                   |       , send_timestamp
                   | FROM `__stat_input__`
@@ -1059,7 +1059,7 @@ object  ETL extends Logging {
                 stat_data.registerTempTable("__stat_data__")
                 val statResult = hqlContext.sql(statAnalysisSql)
                 try {
-                    statResult.write.mode(SaveMode.Append).jdbc(statOutputUrl, statOutputTable, new Properties)
+                    statResult.coalesce(8).write.mode(SaveMode.Append).jdbc(statOutputUrl, statOutputTable, new Properties)
                 } catch {
                     case e: Exception => logWarning("fail to ouput satistical information : " + e.getStackTraceString)
                 }
