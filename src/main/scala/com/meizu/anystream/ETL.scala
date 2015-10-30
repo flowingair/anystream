@@ -1024,9 +1024,9 @@ object  ETL extends Logging {
             val dataExpansionSql =
                 """
                   | SELECT  interface
-                  |       , split(coalesce(ext_domain['ip'], 'Unknown'), ':')  AS host
-                  |       , array_bytes(data) + size(coalesce(data, array()))  AS sendbyte
-                  |       , size(data)         AS linenum
+                  |       , split(coalesce(ext_domain['ip'], 'Unknown'), ':')       AS host
+                  |       , array_bytes(data) + if(isnotnull(data), size(data), 0)  AS sendbyte
+                  |       , if(isnotnull(data), size(data), 0)                      AS linenum
                   |       , send_timestamp
                   | FROM `__stat_input__`
                 """.stripMargin
