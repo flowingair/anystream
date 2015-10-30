@@ -13,6 +13,7 @@ import java.util.Date
 import java.util.TimeZone
 import java.util.Properties
 
+import scala.collection.mutable.{ArrayBuffer, ArrayBuilder}
 import scala.io.Source
 import scala.collection.mutable
 import scala.collection.JavaConverters._
@@ -813,10 +814,10 @@ object  ETL extends Logging {
             val partitionIndex = TaskContext.get().partitionId()
             val fsURI = URI.create(fs)
             val hadoopConf = new Configuration()
-            val strBuilder = mutable.StringBuilder.newBuilder
-            var out : FSDataOutputStream = null
-            var in : ByteArrayInputStream = null
             val bufferSize = 1024 * 1024
+            val utf8Charset = Charset.forName("UTF-8")
+            val bytes = ArrayBuffer.empty[Byte]
+            var out : FSDataOutputStream = null
             try {
                 val path = new Path(paths(partitionIndex))
                 val filesystem  = FileSystem.get(fsURI, hadoopConf)
@@ -824,16 +825,18 @@ object  ETL extends Logging {
                 out = filesystem.append(path)
                 while (part.hasNext) {
                     val row = part.next()
-                    strBuilder ++= s"${row2string(row, dfSchema)}\n"
+                    bytes ++= s"${row2string(row, dfSchema)}\n".getBytes(utf8Charset)
+                    if (bytes.length >= bufferSize) {
+                        out.write(bytes.toArray)
+                        bytes.clear()
+                    }
                 }
-                in = new ByteArrayInputStream(strBuilder.result().getBytes("UTF-8"))
-                IOUtils.copyBytes(in, out, bufferSize)
+                out.write(bytes.toArray)
             } catch {
                 case e: Throwable =>
                     val pathStr = paths.mkString("[", ", ", "]")
                     logWarning(s"can not write into the No. $partitionIndex file in $pathStr :", e)
             } finally {
-                if (in != null) { IOUtils.closeStream(in) }
                 if (out != null) { IOUtils.closeStream(out)}
             }
         })
