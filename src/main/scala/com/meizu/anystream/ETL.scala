@@ -549,7 +549,7 @@ object  ETL extends Logging {
             null
         }
 
-        val isAutoCommit = if (isPhoenixDriver && callbackSQLStr != null) true else false
+        val isAutoCommit = false // if (isPhoenixDriver && callbackSQLStr != null) true else false
         if (isAutoCommit) {
             logInfo("auto commit has already turned on")
         }
@@ -597,6 +597,9 @@ object  ETL extends Logging {
                                 setStatement(stmt, rule, row)
                                 stmt.executeUpdate()
                             })
+                            if (isPhoenixDriver && !isAutoCommit) {
+                                conn.commit()
+                            }
                         }
 //                        lines += 1
 //                        if (linesPerTransaction != 0 && lines >= linesPerTransaction) {
@@ -692,13 +695,14 @@ object  ETL extends Logging {
     }
 
     def createJsonTable(hqlContext: HiveContext, tableName : String, hql : String) : DataFrame = {
-        val df = hqlContext.sql(hql)
-        val stringRDD = df.rdd.map(_.getString(0))
+        val npartions = Math.abs(hqlContext.getConf("anystream.dataframe.partitions", "0").toInt)
+        val df = if (npartions == 0) { hqlContext.sql(hql) } else { hqlContext.sql(hql).coalesce(npartions) }
+        val stringRDD = df.map(_.getString(0))
 //        val jsonDF = hqlContext.jsonRDD(stringRDD)
         val jsonDF = hqlContext.read.json(stringRDD)
         jsonDF.registerTempTable(tableName)
         logInfo(s"the schema of $tableName : \n" + jsonDF.schema.treeString)
-        jsonDF
+        hqlContext.emptyDataFrame
     }
 
     private def getTimeTag : String = {
