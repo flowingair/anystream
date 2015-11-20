@@ -58,8 +58,8 @@ class ETLSuite extends FunSuite with ShouldMatchers{
         println(argument)
         scheme    should be ("hdfs://")
         fsAddr    should be ("mz-hadoop-1.meizu.com:9000")
-        pathURL  should be ("/user/hive/tmp/as_uxip")
-        argument should be ("concurrent=4&partition=true")
+        pathURL   should be ("/user/hive/tmp/as_uxip")
+        argument  should be ("concurrent=4&partition=true")
     }
 
     test("a jsonMatcher should extract clause of creating jsonTable from stringTable") {

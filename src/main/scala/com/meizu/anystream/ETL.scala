@@ -716,46 +716,60 @@ object  ETL extends Logging {
                          fs : String,
                          dir: String,
                          argumentList : Map[String, String]) : Array[String] = {
-        val fsURI = URI.create(fs)
-        val hadoopConf = new Configuration()
-        val filesystem = FileSystem.get(fsURI, hadoopConf)
         val argument = argumentList.map(pair => pair._1 + "=" + pair._2).mkString("&")
-        val sizeThreshold = argumentList.getOrElse("size_threshold", (1024L * 1024L * 1024L).toString).toLong
         val partition = argumentList.getOrElse("partition", "false").toBoolean
         val concurrent = argumentList.getOrElse("concurrent", 2.toString).toInt
         val dstDir = fs + dir + "?" + argument
         val timeTag = getTimeTag
         val ymd = timeTag.take(8)
-        val updatedPaths = fsSinkPaths.get(dstDir) match {
-            case Some(paths) => paths.zipWithIndex.map(pair => {
-                val (str, index) = pair
-                val path = new Path(str)
-                if (filesystem.exists(path) && filesystem.getFileStatus(path).getLen <= sizeThreshold) {
-                    var newStr = str
-                    if (partition) {
-                        val currentPartition = path.getParent.getName
-                        val expectedPartition = s"stat_date=$ymd"
-                        if (currentPartition != expectedPartition) {
-                            newStr = s"$dir/$expectedPartition/${applicationId}__${index}_$timeTag"
-                        }
-                    }
-                    newStr
-                } else {
-                    if (partition) {
-                        s"$dir/stat_date=$ymd/${applicationId}__${index}_$timeTag"
-                    } else {
-                        s"$dir/${applicationId}__${index}_$timeTag"
-                    }
-                }
-            })
+        fsSinkPaths.get(dstDir) match {
+            case Some(oldPaths) => oldPaths
             case None => if (partition) {
                 Range(0, concurrent).toArray.map(index => s"$dir/stat_date=$ymd/${applicationId}__${index}_$timeTag")
             } else {
                 Range(0, concurrent).toArray.map(index => s"$dir/${applicationId}__${index}_$timeTag")
             }
         }
-        fsSinkPaths(dstDir) = updatedPaths
-        updatedPaths
+    }
+
+    private def updatePaths(paths : Array[String],
+                            applicationId : String,
+                            fs : String,
+                            dir: String,
+                            argumentList : Map[String, String]) : (Array[String], List[(String, String)]) = {
+        val fsURI = URI.create(fs)
+        val hadoopConf = new Configuration()
+        val filesystem = FileSystem.get(fsURI, hadoopConf)
+        val sizeThreshold = argumentList.getOrElse("size_threshold", (1024L * 1024L * 1024L).toString).toLong
+        val partition = argumentList.getOrElse("partition", "false").toBoolean
+        val timeTag = getTimeTag
+        val ymd = timeTag.take(8)
+        val newPaths = paths.zipWithIndex.map(pair => {
+            val (pathName, index) = pair
+            val path = new Path(pathName)
+            val isExisted = filesystem.exists(path)
+            val isOverSized = isExisted && filesystem.getFileStatus(path).getLen >= sizeThreshold
+            val isDayChanged =  partition && pathName.takeRight(14).take(8) != ymd
+            val newPathName = if (isOverSized) {
+                if (partition) {
+                    s"$dir/stat_date=$ymd/${applicationId}__${index}_$timeTag"
+                } else {
+                    s"$dir/${applicationId}__${index}_$timeTag"
+                }
+            } else {
+                pathName
+            }
+            val nextBatchPathName = if (isDayChanged) {
+                s"$dir/stat_date=$ymd/${applicationId}__${index}_$timeTag"
+            } else {
+                newPathName
+            }
+            val isChanged = isOverSized || (isExisted && isDayChanged)
+            (nextBatchPathName, isChanged, pathName)
+        })
+        val deltaPaths = newPaths.filter(_._2).map(_._3)
+                .map(pathName => (pathName.takeRight(14).take(8), pathName)).toList
+        (newPaths.map(_._1), deltaPaths)
     }
 
     private def row2string(row : Row, schema : Array[(DataType, Int)], separator : Int = 0x01) : String = {
@@ -809,9 +823,10 @@ object  ETL extends Logging {
             schema + fsAddr.trim
         }
         val applicationId = hqlContext.sparkContext.applicationId
-        val argumentList = argument.split("&").map(_.split("=")).map(arr => (arr(0).trim, arr(1).trim)).toMap
+        val argumentList = argument.split("&").map(_.split("=")).map(arr => (arr(0), arr(1))).toMap
         val paths = getPaths(applicationId, fs, dir, argumentList)
         val concurrent = argumentList.getOrElse("concurrent", 2.toString).toInt
+        val tableName = argumentList.getOrElse("table", "").trim
         val df = hqlContext.sql(hql)
         val dfSchema = df.schema.fields.map(_.dataType).zipWithIndex
         df.repartition(concurrent).foreachPartition(part => {
@@ -844,6 +859,19 @@ object  ETL extends Logging {
                 if (out != null) { IOUtils.closeStream(out)}
             }
         })
+        val (newPaths, deltaPaths) = updatePaths(paths, applicationId, fs, dir, argumentList)
+        if (tableName.nonEmpty && deltaPaths.nonEmpty) {
+            deltaPaths.foreach(pair => {
+                val (ymd, pathName) = pair
+                val hiveLoadStatement =
+                    s"""
+                       |LOAD DATA INPATH '$fs$pathName' INTO TABLE $tableName PARTITION (stat_date = $ymd)
+                     """.stripMargin
+                hqlContext.sql(hiveLoadStatement)
+            })
+        }
+        val dstDir = fs + dir + "?" + argument
+        fsSinkPaths(dstDir) = newPaths
         hqlContext.emptyDataFrame
     }
 
