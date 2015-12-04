@@ -17,6 +17,7 @@ import com.taobao.metamorphosis.client.MetaMessageSessionFactory
 import com.taobao.metamorphosis.client.consumer.ConsumerConfig
 import com.taobao.metamorphosis.client.consumer.MessageConsumer
 import com.taobao.metamorphosis.client.consumer.MessageListener
+import com.taobao.metamorphosis.client.consumer.LoadBalanceStrategy
 import com.taobao.metamorphosis.utils.ZkUtils
 
 //import com.meizu.jmetric.common.ResourceUtils
@@ -32,14 +33,15 @@ import com.taobao.metamorphosis.Message
 // case class MetaQMessage(topic:String, data: Array[Byte], attribute: Option[String])
 
 class MetaQReceiver (
-    private var zkConnect: String, /* MetaQ ZK集群地址 */
-    private var topic: String,     /* 消息主题 */
-    private var group: String,     /* 消息分组 */
-    private var runners: Int
+    private val zkConnect: String, /* MetaQ ZK集群地址 */
+    private val topic: String,     /* 消息主题 */
+    private val group: String,     /* 消息分组 */
+//    private val runners: Int
+    private val metaqParams : Map[String, String]
                                )extends Receiver[Message](StorageLevel.MEMORY_AND_DISK_SER) with Logging {
 
-    private var sessionFactory: MessageSessionFactory = null
-    private var consumer: MessageConsumer = null
+    @transient private var sessionFactory: MessageSessionFactory = null
+    @transient private var consumer: MessageConsumer = null
 
     override def onStart(): Unit ={
          logInfo(s"Starting MetaQ Consumer Stream with group: $group")
@@ -82,10 +84,28 @@ class MetaQReceiver (
         metaClientConfig.setZkConfig(zkConfig)
         sessionFactory = new MetaMessageSessionFactory(metaClientConfig)
 
-        consumerConfig.setFetchRunnerCount(runners)
+        consumerConfig.setFetchRunnerCount(1)
+        metaqParams.foreach( pair => {
+            val (key, value) = pair
+            key match {
+                case "offset" => consumerConfig.setOffset(value.toLong)
+                case "partition" => consumerConfig.setPartition(value)
+                case "fetchRunnerCount" => consumerConfig.setFetchRunnerCount(value.toInt)
+                case "fetchTimeoutInMills" => consumerConfig.setFetchTimeoutInMills(value.toLong)
+                case "maxFetchRetries" => consumerConfig.setMaxFetchRetries(value.toInt)
+                case "maxIncreaseFetchDataRetries" => consumerConfig.setMaxIncreaseFetchDataRetries(value.toInt)
+                case "maxDelayFetchTimeInMills" => consumerConfig.setMaxDelayFetchTimeInMills(value.toLong)
+                case "consumeFromMaxOffset" => if (value.toBoolean) consumerConfig.setConsumeFromMaxOffset(true)
+                case "commitOffsetPeriodInMills" => consumerConfig.setCommitOffsetPeriodInMills(value.toLong)
+                case "loadBalanceStrategyType" => consumerConfig.setLoadBalanceStrategyType(LoadBalanceStrategy.Type.valueOf(value))
+                case _ =>
+            }
+        })
+
         consumer = sessionFactory.createConsumer(consumerConfig)
     }
 }
+
 
 
 

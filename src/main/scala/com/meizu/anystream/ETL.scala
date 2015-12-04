@@ -33,6 +33,8 @@ import org.apache.spark.sql.types._
 import org.apache.spark.sql.hive.HiveContext
 import org.apache.spark.{TaskContext, SparkContext, SparkConf, Logging}
 import org.apache.spark.streaming.{Seconds, StreamingContext}
+import org.apache.spark.sql.Column
+import org.apache.spark.sql.catalyst.expressions.Literal
 
 import com.taobao.metamorphosis.Message
 import com.taobao.metamorphosis.exception.MetaClientException
@@ -829,7 +831,7 @@ object  ETL extends Logging {
         val tableName = argumentList.getOrElse("table", "").trim
         val df = hqlContext.sql(hql)
         val dfSchema = df.schema.fields.map(_.dataType).zipWithIndex
-        df.repartition(concurrent).foreachPartition(part => {
+        df.coalesce(concurrent).foreachPartition(part => {
             val partitionIndex = TaskContext.get().partitionId()
             val fsURI = URI.create(fs)
             val hadoopConf = new Configuration()
@@ -900,7 +902,17 @@ object  ETL extends Logging {
         val metaqZkConnect = getProperty("anystream.metaq.zkConnect", None)
         val metaqTopic  = getProperty("anystream.metaq.topic", None)
         val metaqGroup  = getProperty("anystream.metaq.group", None)
-        val metaqRunner = Math.abs(getProperty("anystream.metaq.runners", Some(5.toString)).toInt)
+        val metaqRunner = getProperty("anystream.metaq.runners", Some(0.toString)).toInt
+        val newMetaqParams = getProperty("anystream.metaq.params", Some("")).trim.split("&").map(setting => {
+            val Array(key, value, _*) = setting.split("=").padTo(2, "")
+            (key.trim, value.trim)
+        }).toMap
+        val metaqParams = if (metaqRunner > 0 ) {
+            newMetaqParams + ("fetchRunnerCount" -> metaqRunner.toString)
+        } else {
+            newMetaqParams
+        }
+        logInfo("metaq configuration parameter setting: \n " + metaqParams.mkString("\n"))
 //        val checkpointInterval = Math.abs(getProperty("anystream.spark.streaming.checkpointInterval", Some("5")).toInt)
         val transformStreamPartitions   = Math.abs(getProperty("anystream.transform.partitions", Some("0")).toInt)
         val lowLatencyStreamPartitions  = Math.abs(getProperty("anystream.lowLatency.partitions",  Some("0")).toInt)
@@ -923,7 +935,7 @@ object  ETL extends Logging {
         val sparkConf = new SparkConf()
 
         val ssc = new StreamingContext(sparkConf, Seconds(streamingInterval))
-        val messages = ssc.receiverStream(new MetaQReceiver(metaqZkConnect, metaqTopic, metaqGroup, metaqRunner))
+        val messages = ssc.receiverStream(new MetaQReceiver(metaqZkConnect, metaqTopic, metaqGroup, metaqParams))
         val msgStream = if ( transformStreamPartitions == 0) {
             messages
         } else {
@@ -981,16 +993,17 @@ object  ETL extends Logging {
             case None => List(("""_""", """SELECT * FROM `__root__`"""))
         }
         
-        val base = asDFStream.transform(rdd => {
+        val base = asDFStream.transform((rdd, time) => {
             val hqlContext = getInstance(rdd.sparkContext)
             import hqlContext.implicits._
 
             var result : DataFrame = null
-            val df = rdd.toDF()
-//            val interfaces = df.select($"interface").distinct.collect().map(_.getString(0))
-//            for (interface <- interfaces) {
-//                df.filter($"interface" <=> interface).registerTempTable(interface + "_asDF")
-//            }
+//            val df = rdd.toDF().withColumn("batch_timestamp", new Column(Literal(time.milliseconds)))
+            val df = rdd.map(load => {
+                val batchTimestamp = "batch_timestamp" -> time.milliseconds.toString
+                load.copy(ext_domain = load.ext_domain + batchTimestamp)
+            }).toDF()
+
             df.registerTempTable("__root__")
             for ((tableName, hql) <- transHqls if !hql.trim.toLowerCase.startsWith("insert")) {
                 val tblDF = executeHql(hqlContext, hql) // hqlContext.sql(hql)
