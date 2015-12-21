@@ -24,8 +24,8 @@ case class MetaQWriter (
     private var zkConnect: String, /* Zookeeper 集群地址 */
     private var topic: String      /* 消息主题 */
 ) extends Logging {
-    private var sessionFactory: MessageSessionFactory = null
-    private var producer: MessageProducer = null
+    @transient private var sessionFactory: MessageSessionFactory = null
+    @transient private var producer: MessageProducer = null
 
 //    loadMetaQConfig()
 //

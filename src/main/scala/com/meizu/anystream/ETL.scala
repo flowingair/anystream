@@ -13,7 +13,7 @@ import java.util.Date
 import java.util.TimeZone
 import java.util.Properties
 
-import scala.collection.mutable.{ArrayBuffer, ArrayBuilder}
+import scala.collection.mutable.{LinkedHashSet, ArrayBuffer, ArrayBuilder}
 import scala.io.Source
 import scala.collection.mutable
 import scala.collection.JavaConverters._
@@ -33,6 +33,7 @@ import org.apache.spark.sql.types._
 import org.apache.spark.sql.hive.HiveContext
 import org.apache.spark.{TaskContext, SparkContext, SparkConf, Logging}
 import org.apache.spark.streaming.{Seconds, StreamingContext}
+import org.apache.spark.sql.hive.thriftserver.HiveThriftServer2
 import org.apache.spark.sql.Column
 import org.apache.spark.sql.catalyst.expressions.Literal
 
@@ -172,11 +173,11 @@ object  ETL extends Logging {
             instance.udf.register("str_to_array_of_map",
                 (str: String, arrayElementDelimiter: String, mapElementDelimiter: String, keyValDelimiter: String) => {
                     if (str != null) {
-                        str.split(arrayElementDelimiter).filter(!_.trim.isEmpty).map(eleStr => {
-                            eleStr.split(mapElementDelimiter).filter(!_.trim.isEmpty)
-                                    .map(_.split(keyValDelimiter).padTo(2, ""))
-                                    .map(arr => (arr(0), arr(1)))
-                                    .toMap
+                        str.split(arrayElementDelimiter).filter(_.trim.nonEmpty).map(eleStr => {
+                            eleStr.split(mapElementDelimiter).filter(_.trim.nonEmpty).map(str => {
+                                val arr = str.split(keyValDelimiter).padTo(2, "")
+                                (arr(0), arr(1))
+                            }).toMap
                         })
                     } else {
                         null
@@ -703,7 +704,7 @@ object  ETL extends Logging {
 //        val jsonDF = hqlContext.jsonRDD(stringRDD)
         val jsonDF = hqlContext.read.json(stringRDD)
         jsonDF.registerTempTable(tableName)
-        logInfo(s"the schema of $tableName : \n" + jsonDF.schema.treeString)
+//        logInfo(s"the schema of $tableName : \n" + jsonDF.schema.treeString)
         hqlContext.emptyDataFrame
     }
 
@@ -787,7 +788,8 @@ object  ETL extends Logging {
                 case BooleanType => if (row.isNullAt(index)) """\N""" else row.getBoolean(index).toString
                 case StringType  => if (row.isNullAt(index)) """\N""" else row.getString(index)
                 case BinaryType  => if (row.isNullAt(index)) """\N""" else {
-                    val bytes = row.getSeq[Byte](index).toArray
+//                    val bytes = row.getSeq[Byte](index).toArray
+                    val bytes = row.get(index).asInstanceOf[Array[Byte]]
                     val encoder = new BASE64Encoder()
                     encoder.encode(bytes)
                 }
@@ -831,7 +833,7 @@ object  ETL extends Logging {
         val tableName = argumentList.getOrElse("table", "").trim
         val df = hqlContext.sql(hql)
         val dfSchema = df.schema.fields.map(_.dataType).zipWithIndex
-        df.coalesce(concurrent).foreachPartition(part => {
+        df.repartition(concurrent).foreachPartition(part => {
             val partitionIndex = TaskContext.get().partitionId()
             val fsURI = URI.create(fs)
             val hadoopConf = new Configuration()
@@ -859,6 +861,7 @@ object  ETL extends Logging {
                     logWarning(s"can not write into the No. $partitionIndex file in $pathStr :", e)
             } finally {
                 if (out != null) { IOUtils.closeStream(out)}
+                bytes.clear()
             }
         })
         val (newPaths, deltaPaths) = updatePaths(paths, applicationId, fs, dir, argumentList)
@@ -891,6 +894,83 @@ object  ETL extends Logging {
             case hdfsMatcher(hdfsURL, hqlStr) => writeHDFS(hqlContext, hdfsURL.trim, hqlStr.trim)
             case _ => hqlContext.sql(hql)
         }
+    }
+
+    /**
+     * A workaround for bug specified by SPARK-10251 <a href = "https://issues.apache.org/jira/browse/SPARK-10251">
+     * Some internal spark classes are not registered with kryo</a>
+     */
+    def registerExtraKryoClasses(conf : SparkConf)  = {
+        val allClassNames = new LinkedHashSet[String]()
+        val extraKryoClasses = Array(
+            // Register types missed by Chill.
+              None.getClass.getName
+            , Nil.getClass.getName
+            , "[Lscala.Tuple1;"
+            , "[Lscala.Tuple2;"
+            , "[Lscala.Tuple3;"
+            , "[Lscala.Tuple4;"
+            , "[Lscala.Tuple5;"
+            , "[Lscala.Tuple6;"
+            , "[Lscala.Tuple7;"
+            , "[Lscala.Tuple8;"
+            , "[Lscala.Tuple9;"
+            , "[Lscala.Tuple10;"
+            , "[Lscala.Tuple11;"
+            , "[Lscala.Tuple12;"
+            , "[Lscala.Tuple13;"
+            , "[Lscala.Tuple14;"
+            , "[Lscala.Tuple15;"
+            , "[Lscala.Tuple16;"
+            , "[Lscala.Tuple17;"
+            , "[Lscala.Tuple18;"
+            , "[Lscala.Tuple19;"
+            , "[Lscala.Tuple20;"
+            , "[Lscala.Tuple21;"
+            , "[Lscala.Tuple22;"
+            , "scala.collection.immutable.$colon$colon"
+            , "scala.collection.mutable.WrappedArray$ofRef"
+            , "scala.collection.immutable.Map$EmptyMap$"
+            , classOf[ArrayBuffer[Any]].getName
+            , classOf[Array[Any]].getName
+            , classOf[scala.collection.immutable.Range].getName
+            , classOf[java.util.concurrent.ConcurrentHashMap[_, _]].getName
+
+            // Register types used by anystream
+            , classOf[org.apache.spark.sql.catalyst.expressions.GenericRowWithSchema].getName
+            , "org.apache.spark.sql.types.ByteType$"
+            , "org.apache.spark.sql.types.ShortType$"
+            , "org.apache.spark.sql.types.IntegerType$"
+            , "org.apache.spark.sql.types.LongType$"
+            , "org.apache.spark.sql.types.FloatType$"
+            , "org.apache.spark.sql.types.DoubleType$"
+            , "org.apache.spark.sql.types.DecimalType$"
+            , "org.apache.spark.sql.types.StringType$"
+            , "org.apache.spark.sql.types.BinaryType$"
+            , "org.apache.spark.sql.types.BooleanType$"
+            , "org.apache.spark.sql.types.TimestampType$"
+            , "org.apache.spark.sql.types.DateType$"
+            , "org.apache.spark.sql.types.ArrayType$"
+            , "org.apache.spark.sql.types.MapType$"
+            , classOf[org.apache.spark.sql.types.ArrayType].getName
+            , classOf[org.apache.spark.sql.types.MapType].getName
+            , classOf[org.apache.spark.sql.types.StructField].getName
+            , classOf[org.apache.spark.sql.types.StructType].getName
+            , classOf[org.apache.spark.sql.types.Metadata].getName
+            , classOf[org.apache.spark.sql.types.UTF8String].getName
+            , classOf[Array[org.apache.spark.sql.types.StructField]].getName
+            , classOf[Array[org.apache.spark.streaming.receiver.Receiver[_]]].getName
+
+            , classOf[com.taobao.metamorphosis.Message].getName
+            , classOf[com.taobao.metamorphosis.cluster.Partition].getName
+
+            , classOf[com.meizu.spark.streaming.metaq.MetaQReceiver].getName
+            , classOf[com.meizu.spark.metaq.MetaQWriter].getName
+            , classOf[Load].getName
+        )
+        allClassNames ++= conf.get("spark.kryo.classesToRegister", "").split(',').filter(_.nonEmpty)
+        allClassNames ++= extraKryoClasses
+        conf.set("spark.kryo.classesToRegister", allClassNames.mkString(","))
     }
 
     def createStreamingContext(checkpointDirectory: String,
@@ -933,9 +1013,15 @@ object  ETL extends Logging {
                 .map(Seconds(_))
 
         val sparkConf = new SparkConf()
-
+        registerExtraKryoClasses(sparkConf)
         val ssc = new StreamingContext(sparkConf, Seconds(streamingInterval))
-        val messages = ssc.receiverStream(new MetaQReceiver(metaqZkConnect, metaqTopic, metaqGroup, metaqParams))
+
+//        val messages = ssc.receiverStream(new MetaQReceiver(metaqZkConnect, metaqTopic, metaqGroup, metaqParams))
+        val numReceivers = metaqParams.getOrElse("fetchRunnerCount", "2").toInt
+        val metaqStreams = (1 to numReceivers).map(i => {
+            ssc.receiverStream(new MetaQReceiver(metaqZkConnect, metaqTopic, metaqGroup, metaqParams))
+        })
+        val messages = ssc.union(metaqStreams)
         val msgStream = if ( transformStreamPartitions == 0) {
             messages
         } else {
@@ -958,14 +1044,27 @@ object  ETL extends Logging {
                 val data = magic match {
                     case 0 =>
                         new String(bytes, charset).split("\n").map(str => {
-                            str.replace(0x01.toChar, 0x11.toChar)
-                               .replace(0x02.toChar, 0x12.toChar)
-                               .replace(0x03.toChar, 0x13.toChar)
-                               .replace(0x04.toChar, 0x14.toChar)
-                               .replace(0x05.toChar, 0x15.toChar)
-                               .replace(0x06.toChar, 0x16.toChar)
-                               .replace(0x07.toChar, 0x17.toChar)
-                               .getBytes(charset)
+//                            str.replace(0x01.toChar, 0x11.toChar)
+//                               .replace(0x02.toChar, 0x12.toChar)
+//                               .replace(0x03.toChar, 0x13.toChar)
+//                               .replace(0x04.toChar, 0x14.toChar)
+//                               .replace(0x05.toChar, 0x15.toChar)
+//                               .replace(0x06.toChar, 0x16.toChar)
+//                               .replace(0x07.toChar, 0x17.toChar)
+//                               .getBytes(charset)
+
+                            str.map(chr => {
+                                chr.toInt match {
+                                    case 0x01 => 0x11.toChar
+                                    case 0x02 => 0x12.toChar
+                                    case 0x03 => 0x13.toChar
+                                    case 0x04 => 0x14.toChar
+                                    case 0x05 => 0x15.toChar
+                                    case 0x06 => 0x16.toChar
+                                    case 0x07 => 0x17.toChar
+                                    case others => others.toChar
+                                }
+                            }).getBytes(charset)
                         })
                     case 1 =>
                         new String(bytes, charset).split("\n").map(str => {
@@ -1088,6 +1187,7 @@ object  ETL extends Logging {
                   |       , sum(sendbyte)     AS sendbyte
                   |       , sum(linenum)      AS linenum
                   |       , sendtime
+                  |       , unix_timestamp()  AS inserttime
                   | FROM ( SELECT   interface
                   |               , concat_ws(':', host[1], host[2]) AS hostip
                   |               , sendbyte
@@ -1157,6 +1257,8 @@ object  ETL extends Logging {
                 sc.stop()
             }
         })
+//        val hqlContext = getInstance(ssc.sparkContext)
+//        HiveThriftServer2.startWithContext(hqlContext)
         ssc.start()
         ssc.awaitTermination()
     }

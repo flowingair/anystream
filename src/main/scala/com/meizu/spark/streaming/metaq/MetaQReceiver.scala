@@ -90,7 +90,7 @@ class MetaQReceiver (
             key match {
                 case "offset" => consumerConfig.setOffset(value.toLong)
                 case "partition" => consumerConfig.setPartition(value)
-                case "fetchRunnerCount" => consumerConfig.setFetchRunnerCount(value.toInt)
+//                case "fetchRunnerCount" => consumerConfig.setFetchRunnerCount(value.toInt)
                 case "fetchTimeoutInMills" => consumerConfig.setFetchTimeoutInMills(value.toLong)
                 case "maxFetchRetries" => consumerConfig.setMaxFetchRetries(value.toInt)
                 case "maxIncreaseFetchDataRetries" => consumerConfig.setMaxIncreaseFetchDataRetries(value.toInt)
