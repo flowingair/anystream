@@ -1044,33 +1044,9 @@ object  ETL extends Logging {
                 }
                 val data = magic match {
                     case 0 =>
-                        new String(bytes, charset).split("\n").map(str => {
-//                            str.replace(0x01.toChar, 0x11.toChar)
-//                               .replace(0x02.toChar, 0x12.toChar)
-//                               .replace(0x03.toChar, 0x13.toChar)
-//                               .replace(0x04.toChar, 0x14.toChar)
-//                               .replace(0x05.toChar, 0x15.toChar)
-//                               .replace(0x06.toChar, 0x16.toChar)
-//                               .replace(0x07.toChar, 0x17.toChar)
-//                               .getBytes(charset)
-
-                            str.map(chr => {
-                                chr.toInt match {
-                                    case 0x01 => 0x11.toChar
-                                    case 0x02 => 0x12.toChar
-                                    case 0x03 => 0x13.toChar
-                                    case 0x04 => 0x14.toChar
-                                    case 0x05 => 0x15.toChar
-                                    case 0x06 => 0x16.toChar
-                                    case 0x07 => 0x17.toChar
-                                    case others => others.toChar
-                                }
-                            }).getBytes(charset)
-                        })
+                        new String(bytes, charset).split("\n").map(_.getBytes(charset))
                     case 1 =>
-                        new String(bytes, charset).split("\n").map(str => {
-                            str.getBytes(charset)
-                        })
+                        new String(bytes, charset).split("\n").map(_.getBytes(charset))
                     case _ =>
                         Array.empty[Array[Byte]]
                 }
