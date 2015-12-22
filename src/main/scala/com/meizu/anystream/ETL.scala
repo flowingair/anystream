@@ -704,7 +704,8 @@ object  ETL extends Logging {
 //        val jsonDF = hqlContext.jsonRDD(stringRDD)
         val jsonDF = hqlContext.read.json(stringRDD)
         jsonDF.registerTempTable(tableName)
-//        logInfo(s"the schema of $tableName : \n" + jsonDF.schema.treeString)
+        hqlContext.cacheTable(tableName)
+        logInfo(s"the schema of $tableName : \n" + jsonDF.schema.treeString)
         hqlContext.emptyDataFrame
     }
 
@@ -1094,6 +1095,7 @@ object  ETL extends Logging {
         
         val base = asDFStream.transform((rdd, time) => {
             val hqlContext = getInstance(rdd.sparkContext)
+            hqlContext.clearCache()
             import hqlContext.implicits._
 
             var result : DataFrame = null
@@ -1108,10 +1110,15 @@ object  ETL extends Logging {
                 val tblDF = executeHql(hqlContext, hql) // hqlContext.sql(hql)
                 if (tableName != "_") {
                     val npartions = Math.abs(hqlContext.getConf("anystream.dataframe.partitions", "0").toInt)
+                    val isCached = hqlContext.getConf("anystream.dataframe.cache", "false").toBoolean
                     if (npartions == 0) {
                         tblDF.registerTempTable(tableName)
                     } else {
                         tblDF.coalesce(npartions).registerTempTable(tableName)
+                    }
+                    if (isCached) {
+                        hqlContext.cacheTable(tableName)
+                        hqlContext.setConf("anystream.dataframe.cache", "false")
                     }
                 }
                 result = tblDF
@@ -1145,10 +1152,15 @@ object  ETL extends Logging {
                             val tblDF = executeHql(hqlContext, hql) // hqlContext.sql(hql)
                             if (tableName != "_") {
                                 val npartions = Math.abs(hqlContext.getConf("anystream.dataframe.partitions", "0").toInt)
+                                val isCached = hqlContext.getConf("anystream.dataframe.cache", "false").toBoolean
                                 if (npartions == 0) {
                                     tblDF.registerTempTable(tableName)
                                 } else {
                                     tblDF.coalesce(npartions).registerTempTable(tableName)
+                                }
+                                if (isCached) {
+                                    hqlContext.cacheTable(tableName)
+                                    hqlContext.setConf("anystream.dataframe.cache", "false")
                                 }
                             }
                         }
