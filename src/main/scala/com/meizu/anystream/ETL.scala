@@ -34,7 +34,6 @@ import org.apache.spark.sql.hive.HiveContext
 import org.apache.spark.{TaskContext, SparkContext, SparkConf, Logging}
 import org.apache.spark.streaming.{Seconds, StreamingContext}
 import org.apache.spark.sql.hive.thriftserver.HiveThriftServer2
-import org.apache.spark.sql.Column
 import org.apache.spark.sql.catalyst.expressions.Literal
 
 import com.taobao.metamorphosis.Message
@@ -128,6 +127,13 @@ object  ETL extends Logging {
 
     final val fsSinkPaths =  scala.collection.mutable.Map.empty[String, Array[String]]
 
+    case class UXIP(app_name : String,
+                    app_ver : String,
+                    session_id : String,
+                    session_enter : Long,
+                    session_exit : Long,
+                    platform : Map[String, String],
+                    misc : Array[Map[String, String]])
 
     // Instantiate HiveContext on demand
     def getInstance(sparkContext: SparkContext): HiveContext = synchronized {
@@ -257,6 +263,70 @@ object  ETL extends Logging {
                 } else {
                     0
                 }
+            })
+            instance.udf.register("str_to_uxip", (str : String) => {
+                var UXIP(appName, appVer, sessionId, sessionEnter, sessionExit, platform, misc) =
+                    UXIP(null, null, null, 0, 0, null, null)
+                var fieldPos = 0
+                var key = null.asInstanceOf[String]
+                var value = null.asInstanceOf[String]
+                val kv = mutable.Map.empty[String, String]
+                val fieldBuider = mutable.StringBuilder.newBuilder
+                val miscBuilder = new ArrayBuffer[Map[String,String]](str.length)
+                val strIt = (str + s"${0x01.toChar}").iterator
+                while (strIt.hasNext && fieldPos < 7) {
+                    val chr = strIt.next()
+                    chr.toInt match {
+                        case 0x01 =>
+                            fieldPos += 1
+                            fieldPos match {
+                                case 1 => appName = fieldBuider.mkString
+                                case 2 => appVer = fieldBuider.mkString
+                                case 3 => sessionId = fieldBuider.mkString
+                                case 4 => sessionEnter = fieldBuider.mkString.toLong
+                                case 5 => sessionExit  = fieldBuider.mkString.toLong
+                                case 6 =>
+                                    value = fieldBuider.mkString
+                                    kv(key) = value
+                                    platform = kv.toMap
+                                    kv.clear()
+                                case 7 =>
+                                    value = fieldBuider.mkString
+                                    kv(key) = value
+                                    miscBuilder.append(kv.toMap)
+                                    kv.clear()
+                                    misc = miscBuilder.toArray
+                                    miscBuilder.clear()
+                            }
+                            fieldBuider.clear()
+                        case 0x02 =>
+                            fieldPos match {
+                                case 5 =>
+                                    value = fieldBuider.mkString
+                                    kv(key) = value
+                                case 6 =>
+                                    value = fieldBuider.mkString
+                                    kv(key) = value
+                                    miscBuilder.append(kv.toMap)
+                                    kv.clear()
+                            }
+                            fieldBuider.clear()
+                        case 0x03 =>
+                            fieldPos match {
+                                case 5 =>
+                                    key = fieldBuider.mkString
+                                case 6 =>
+                                    value = fieldBuider.mkString
+                                    kv(key) = value
+                            }
+                            fieldBuider.clear()
+                        case 0x04 =>
+                            key = fieldBuider.mkString
+                            fieldBuider.clear()
+                        case _ => fieldBuider.append(chr)
+                    }
+                }
+                UXIP(appName, appVer, sessionId, sessionEnter, sessionExit, platform, misc)
             })
         }
         instance
@@ -1056,10 +1126,10 @@ object  ETL extends Logging {
             } catch{
                 case e: InvalidProtocolBufferException =>
                     logWarning("invalid message format : " + e.getStackTraceString)
-                    Load(null, null, null, null, null, null, null)
+                    Load(null, null, null, Array.empty[Array[Byte]], Map.empty[String, String], null, null)
                 case ex: Throwable =>
                     logWarning("unknown exception : " + ex.getStackTraceString)
-                    Load(null, null, null, null, null, null, null)
+                    Load(null, null, null, Array.empty[Array[Byte]], Map.empty[String, String], null, null)
             }
         })
 
