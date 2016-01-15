@@ -8,6 +8,9 @@ anystream.metaq.topic                            ORION_UXIP_DATA
 anystream.metaq.group                            ORION_UXIP_ETL
 anystream.metaq.runners                          5
 
+anystream.ha.zkConnect                           172.16.200.239:2181,172.16.200.233:2181,172.16.200.234:2181
+anystream.ha.znode.parent                        /anystream/spark
+
 anystream.lowLatency.window                      1:1
 anystream.highLatency.window                     20:20
 anystream.transform.partitions                   2

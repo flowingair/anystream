@@ -1,6 +1,6 @@
 package com.meizu.anystream
 
-import java.net.URI
+import java.net.{InetAddress, URI}
 import java.io.ByteArrayInputStream
 
 import sun.misc.{BASE64Encoder, Signal, SignalHandler}
@@ -1290,6 +1290,24 @@ object  ETL extends Logging {
         }
     }
 
+    private def startHiveThriftServer(sc : SparkContext) : String = {
+        val hqlContext = getInstance(sc)
+        val driverIP =  InetAddress.getLocalHost.getHostAddress
+        var (isSuccess, port) = (false, 10000)
+        while (!isSuccess){
+            try {
+                hqlContext.setConf("hive.server2.thrift.port", port.toString)
+                HiveThriftServer2.startWithContext(hqlContext)
+                isSuccess = true
+            } catch {
+                case _: Exception =>
+                    port += 1
+                    logWarning("Port conflict when starting HiveThriftServer2, retry ...")
+            }
+        }
+        s"jdbc:hive2://$driverIP:$port"
+    }
+
     def main(args : Array[String]) {
         val optsConf = if (args.length != 0) {
             new ArgsOptsConf(args)
@@ -1306,18 +1324,11 @@ object  ETL extends Logging {
         val ssc = StreamingContext.getOrCreate(checkpointDirectory, () =>
             createStreamingContext(checkpointDirectory, transHqlPath, lowLatencyHqlPath, highLatencyHqlPath))
 
-        Signal.handle(new Signal("TERM"), new SignalHandler {
-            override def handle(signal: Signal): Unit = {
-                val sc = ssc.sparkContext
-                log.info("Stopping gracefully Spark Streaming!")
-                ssc.stop(stopSparkContext = false, stopGracefully = true)
-                log.info("Spark Stream has gracefully stopped")
-                sc.stop()
-            }
-        })
-//        val hqlContext = getInstance(ssc.sparkContext)
-//        HiveThriftServer2.startWithContext(hqlContext)
+        val thriftServerURL = startHiveThriftServer(ssc.sparkContext)
+        logInfo(s"start hive thrift server on $thriftServerURL")
+        val ha = new HighAvailability(ssc, thriftServerURL)
         ssc.start()
+        ha.start()
         ssc.awaitTermination()
     }
 }
