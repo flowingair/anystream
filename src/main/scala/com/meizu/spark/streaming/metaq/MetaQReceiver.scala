@@ -3,7 +3,7 @@ package com.meizu.spark.streaming.metaq
 //import java.io.IOException
 //import java.util.Properties
 import java.nio.ByteBuffer
-import java.util.concurrent.Executor
+import java.util.concurrent._
 
 import org.apache.spark.{SparkConf, Logging}
 import org.apache.spark.storage.StorageLevel
@@ -42,18 +42,36 @@ class MetaQReceiver (
 
     @transient private var sessionFactory: MessageSessionFactory = null
     @transient private var consumer: MessageConsumer = null
+    @transient private var pool: ExecutorService = null
 
     override def onStart(): Unit ={
          logInfo(s"Starting MetaQ Consumer Stream with group: $group")
          initMetaQ()
          consumer.subscribe(topic, 1024 * 1024, new MessageListener() {
              def recieveMessages (message: Message): Unit = {
-                 try {
-                     store(message)
-                 } catch {
-                     case iex: InterruptedException => throw iex
-                     case _ : Throwable => throw new RuntimeException
-                 }
+                 do {
+                     if (pool == null) {
+                         pool = Executors.newFixedThreadPool(2)
+                     }
+                     val result = pool.submit(new Runnable {
+                         override def run(): Unit = {
+                             try {
+                                 store(message)
+                             } catch {
+                                 case iex: InterruptedException => throw iex
+                                 case _: Throwable => throw new RuntimeException
+                             }
+                         }
+                     })
+                     try {
+                         result.get(3, TimeUnit.SECONDS)
+                     } catch {
+                         case _: TimeoutException =>
+                             logWarning("A potential deadlock in receiver is possibly triggered")
+                             pool.shutdownNow()
+                             pool = null
+                     }
+                 } while (pool == null)
              }
 
              def getExecutor: Executor = {
@@ -72,6 +90,9 @@ class MetaQReceiver (
         if (sessionFactory != null){
             sessionFactory.shutdown()
             sessionFactory = null
+        }
+        if (pool != null) {
+            pool.shutdown()
         }
     }
 
@@ -103,6 +124,7 @@ class MetaQReceiver (
         })
 
         consumer = sessionFactory.createConsumer(consumerConfig)
+        pool = Executors.newFixedThreadPool(2)
     }
 }
 

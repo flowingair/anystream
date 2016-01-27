@@ -937,14 +937,20 @@ object  ETL extends Logging {
         })
         val (newPaths, deltaPaths) = updatePaths(paths, applicationId, fs, dir, argumentList)
         if (tableName.nonEmpty && deltaPaths.nonEmpty) {
-            deltaPaths.foreach(pair => {
-                val (ymd, pathName) = pair
-                val hiveLoadStatement =
-                    s"""
-                       |LOAD DATA INPATH '$fs$pathName' INTO TABLE $tableName PARTITION (stat_date = $ymd)
-                     """.stripMargin
-                hqlContext.sql(hiveLoadStatement)
-            })
+//            deltaPaths.foreach(pair => {
+//                val (ymd, pathName) = pair
+//                val hiveLoadStatement =
+//                    s"""
+//                       |LOAD DATA INPATH '$fs$pathName' INTO TABLE $tableName PARTITION (stat_date = $ymd)
+//                     """.stripMargin
+//                hqlContext.sql(hiveLoadStatement)
+//            })
+            val Array(table, db) = tableName.split("\\.").reverse.padTo(2, "").take(2)
+            if (db.trim.nonEmpty) {
+                hqlContext.sql(s"USE $db")
+            }
+            val MetadataCheckoutSQL = s"MSCK REPAIR TABLE $table"
+            hqlContext.sql(MetadataCheckoutSQL)
         }
         val dstDir = fs + dir + "?" + argument
         fsSinkPaths(dstDir) = newPaths
@@ -1218,6 +1224,7 @@ object  ETL extends Logging {
         val statOutputUrl   = getProperty("anystream.stat.output.url", Some("")).trim
         val statOutputTable = getProperty("anystream.stat.output.table", Some("T_ANYSTREAM_STAT")).trim
         val statInterfaces  = getProperty("anystream.stat.interfaces", Some("")).trim
+        val statOutputMode = getProperty("anystream.stat.output.mode", Some("1")).trim.toInt
         if (!statOutputUrl.trim.isEmpty) {
             val statInterfacesList = statInterfaces.trim.split(',').filterNot(_.trim.isEmpty)
             val interfacesFilterSql = if (statInterfacesList.isEmpty) {
@@ -1235,8 +1242,28 @@ object  ETL extends Logging {
                   |       , send_timestamp
                   | FROM `__stat_input__`
                 """.stripMargin
-            val statAnalysisSql =
-                s"""
+            val statAnalysisSql = statOutputMode match {
+                case 0 =>
+                    s"""
+                       | SELECT  cast(NULL AS INT) AS id
+                       |       , 'merger'          AS vendor
+                       |       , '$metaqTopic'     AS topic
+                       |       , interface
+                       |       , hostip
+                       |       , sum(sendbyte)     AS sendbyte
+                       |       , sum(linenum)      AS linenum
+                       |       , sendtime
+                       |       , unix_timestamp()  AS inserttime
+                       | FROM ( SELECT   interface
+                       |               , concat_ws(':', host[1], host[2]) AS hostip
+                       |               , sendbyte
+                       |               , linenum
+                       |               , partitioner('m', send_timestamp) AS sendtime
+                       |        FROM `__stat_data__` ) tmp
+                       | GROUP BY interface, hostip, sendtime
+                """.stripMargin
+                case 1 =>
+                    s"""
                   | SELECT  cast(NULL AS INT) AS id
                   |       , 'merger'          AS vendor
                   |       , '$metaqTopic'     AS topic
@@ -1246,6 +1273,7 @@ object  ETL extends Logging {
                   |       , sum(linenum)      AS linenum
                   |       , sendtime
                   |       , unix_timestamp()  AS inserttime
+                  |       , '$metaqGroup'     AS group
                   | FROM ( SELECT   interface
                   |               , concat_ws(':', host[1], host[2]) AS hostip
                   |               , sendbyte
@@ -1254,6 +1282,7 @@ object  ETL extends Logging {
                   |        FROM `__stat_data__` ) tmp
                   | GROUP BY interface, hostip, sendtime
                 """.stripMargin
+            }
             val statWindow = Seconds(Math.ceil(60.0 / streamingInterval).toInt * streamingInterval)
             asDFStream.window(statWindow, statWindow).foreachRDD(rdd => {
                 val hqlContext = getInstance(rdd.sparkContext)
@@ -1323,6 +1352,16 @@ object  ETL extends Logging {
         val checkpointDirectory = getProperty("anystream.spark.streaming.checkpointDir", None)
         val ssc = StreamingContext.getOrCreate(checkpointDirectory, () =>
             createStreamingContext(checkpointDirectory, transHqlPath, lowLatencyHqlPath, highLatencyHqlPath))
+
+        Signal.handle(new Signal("TERM"), new SignalHandler {
+            override def handle(signal: Signal): Unit = {
+                val sc = ssc.sparkContext
+                log.info("Stopping gracefully Spark Streaming!")
+                ssc.stop(stopSparkContext = false, stopGracefully = true)
+                log.info("Spark Stream has gracefully stopped")
+                sc.stop()
+            }
+        })
 
         val thriftServerURL = startHiveThriftServer(ssc.sparkContext)
         logInfo(s"start hive thrift server on $thriftServerURL")
