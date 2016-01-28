@@ -45,40 +45,48 @@ class MetaQReceiver (
     @transient private var pool: ExecutorService = null
 
     override def onStart(): Unit ={
-         logInfo(s"Starting MetaQ Consumer Stream with group: $group")
-         initMetaQ()
-         consumer.subscribe(topic, 1024 * 1024, new MessageListener() {
-             def recieveMessages (message: Message): Unit = {
-                 do {
-                     if (pool == null) {
-                         pool = Executors.newFixedThreadPool(2)
-                     }
-                     val result = pool.submit(new Runnable {
-                         override def run(): Unit = {
-                             try {
-                                 store(message)
-                             } catch {
-                                 case iex: InterruptedException => throw iex
-                                 case _: Throwable => throw new RuntimeException
-                             }
-                         }
-                     })
-                     try {
-                         result.get(3, TimeUnit.SECONDS)
-                     } catch {
-                         case _: TimeoutException =>
-                             logWarning("A potential deadlock in receiver is possibly triggered")
-                             pool.shutdownNow()
-                             pool = null
-                     }
-                 } while (pool == null)
-             }
+        logInfo(s"Starting MetaQ Consumer Stream with group: $group")
+        initMetaQ()
+        consumer.subscribe(topic, 1024 * 1024, new MessageListener() {
+            def recieveMessages (message: Message): Unit = {
+                val storeThread = new Runnable {
+                    private var localThreadId : Thread = null
+                    override def run(): Unit = {
+                        localThreadId = Thread.currentThread()
+                        try {
+                            store(message)
+                        } catch {
+                            case iex: InterruptedException => throw iex
+                            case _: Throwable => throw new RuntimeException
+                        }
+                    }
+                    def stop() : Unit = if (localThreadId != null) localThreadId.stop()
+                }
+                do {
+                    if (pool == null) {
+                        pool = Executors.newFixedThreadPool(2)
+                    }
+                    val result = pool.submit(storeThread)
+                    try {
+                        result.get(3, TimeUnit.SECONDS)
+                    } catch {
+                        case _: TimeoutException =>
+                            logWarning("A potential deadlock in receiver is possibly triggered")
+                            pool.shutdownNow()
+                            storeThread.stop()
+                            pool = null
+                            logWarning("forcibly stop deadlock thread, and sleep for 2 seconed ...")
+                            Thread.sleep(2000)
+                            logWarning("sleep ends and retry ...")
+                    }
+                } while (pool == null)
+            }
 
-             def getExecutor: Executor = {
-                 null
-             }
-         })
-         consumer.completeSubscribe()
+            def getExecutor: Executor = {
+                null
+            }
+        })
+        consumer.completeSubscribe()
     }
 
     override def onStop(): Unit = {
