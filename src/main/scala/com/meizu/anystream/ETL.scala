@@ -1090,7 +1090,7 @@ object  ETL extends Logging {
                 .map(Seconds(_))
 
         val sparkConf = new SparkConf()
-        registerExtraKryoClasses(sparkConf)
+//        registerExtraKryoClasses(sparkConf)
         val ssc = new StreamingContext(sparkConf, Seconds(streamingInterval))
 
 //        val messages = ssc.receiverStream(new MetaQReceiver(metaqZkConnect, metaqTopic, metaqGroup, metaqParams))
@@ -1363,9 +1363,11 @@ object  ETL extends Logging {
             }
         })
 
-        val thriftServerURL = startHiveThriftServer(ssc.sparkContext)
-        logInfo(s"start hive thrift server on $thriftServerURL")
-        val ha = new HighAvailability(ssc, thriftServerURL)
+//        val thriftServerURL = startHiveThriftServer(ssc.sparkContext)
+//        logInfo(s"start hive thrift server on $thriftServerURL")
+//        val ha = new HighAvailability(ssc, thriftServerURL)
+        val driverIP = InetAddress.getLocalHost.getHostAddress
+        val ha = new HighAvailability(ssc, driverIP)
         ssc.start()
         ha.start()
         ssc.awaitTermination()
